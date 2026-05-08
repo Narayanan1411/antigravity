@@ -1,0 +1,36 @@
+psutil
+netifaces
+requests
+fastapi
+uvicorn[standard]
+pydantic
+# Merged from root requirements.txt
+# Guardient — All Dependencies
+# Install: pip install -r requirements.txt
+
+# System Monitoring
+psutil==7.2.2
+
+# Web API (System Monitor)
+fastapi==0.133.0
+uvicorn==0.41.0
+
+# Docker Monitoring
+docker==7.1.0
+
+# Kafka Pipeline
+kafka-python==2.3.0
+
+# Identity Collector (LDAP)
+ldap3==2.9.1
+pyasn1==0.6.2
+
+# GCP Cloud Collector
+google-cloud-logging==3.13.0
+google-cloud-compute==1.44.0
+google-auth==2.48.0
+grpcio==1.78.0
+grpcio-status==1.78.0
+proto-plus==1.27.1
+protobuf==6.33.5
+pyasn1_modules==0.4.2

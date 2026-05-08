@@ -1,0 +1,170 @@
+"""
+Guardient Ingestion API  v1
+============================
+FastAPI server. Four endpoints — one per telemetry category.
+Each endpoint:
+  1. validates the API key
+  2. normalises the payload into standard GuardientEvent dicts
+  3. publishes each event to Kafka topic: raw_events
+  4. saves locally to <category>.jsonl as fallback
+
+Run:
+    cd "/Users/kselvanarayanan/Desktop/poc Guardient"
+    python3 -m uvicorn api.main:app --port 8000
+"""
+
+import os
+import sys
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+
+ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(ROOT))
+
+from pipeline.producer import publish_event
+from pipeline.topics import RAW_EVENTS
+from api.schema import (
+    events_from_network,
+    events_from_identity,
+    events_from_cloud,
+    events_from_hardware,
+)
+from api.device_resolver import resolve_device
+from dotenv import load_dotenv
+load_dotenv()
+
+from api.v1 import router as v1_router
+
+# ── API keys ──────────────────────────────────────────────
+KEYS = {
+    "network":  os.getenv("NETWORK_KEY",  "NET-KEY-2F4A8C1B"),
+    "identity": os.getenv("IDENTITY_KEY", "IDN-KEY-7E3B9D2A"),
+    "cloud":    os.getenv("CLOUD_KEY",    "CLD-KEY-5C1F4A8E"),
+    "hardware": os.getenv("HARDWARE_KEY", "HW-KEY-3A9D7F2C"),
+}
+
+LOG_DIR = ROOT / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+app = FastAPI(title="Guardient Telemetry API", version="1.0")
+
+# ── CORS — allow the Next.js dev server ───────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://localhost:3001"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Frontend bridge: v1 REST API ──────────────────────────
+app.include_router(v1_router, prefix="/api/v1")
+
+
+def _check_key(category: str, key: Optional[str]):
+    if key != KEYS[category]:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
+
+def _save_local(category: str, events: list):
+    path = LOG_DIR / f"{category}.jsonl"
+    with open(path, "a") as f:
+        for ev in events:
+            f.write(json.dumps(ev) + "\n")
+
+
+def _ingest(category: str, events: list) -> dict:
+    published = 0
+    for ev in events:
+        # Resolve stable device ID before it enters Kafka
+        device_id = resolve_device(ev)
+        ev["device_id"] = device_id
+        
+        # Drop virtual-interface noise — never enters the pipeline
+        if device_id == "dev_ignored":
+            continue
+        
+        if publish_event(RAW_EVENTS, ev):
+            published += 1
+    _save_local(category, events)
+    return {
+        "status":        "ok",
+        "category":      category,
+        "events":        len(events),
+        "published":     published,
+        "saved_locally": len(events),
+        "timestamp":     datetime.now(tz=timezone.utc).isoformat(),
+    }
+
+
+# ═══════════════════════════════════════════════
+# Endpoints
+# ═══════════════════════════════════════════════
+
+@app.post("/network/telemetry")
+async def ingest_network(
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None),
+):
+    _check_key("network", x_api_key)
+    body   = await request.json()
+    events = events_from_network(body)
+    return _ingest("network", events)
+
+
+@app.post("/identity/events")
+async def ingest_identity(
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None),
+):
+    _check_key("identity", x_api_key)
+    body   = await request.json()
+    events = events_from_identity(body)
+    return _ingest("identity", events)
+
+
+@app.post("/cloud/events")
+async def ingest_cloud(
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None),
+):
+    _check_key("cloud", x_api_key)
+    body   = await request.json()
+    events = events_from_cloud(body)
+    return _ingest("cloud", events)
+
+
+@app.post("/hardware/profile")
+async def ingest_hardware(
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None),
+):
+    _check_key("hardware", x_api_key)
+    body   = await request.json()
+    events = events_from_hardware(body)
+    return _ingest("hardware", events)
+
+
+@app.post("/temporal/metrics")
+async def ingest_temporal(
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None),
+):
+    body = await request.json()
+    _save_local("temporal", [body])
+    return {"status": "ok", "category": "temporal", "saved_locally": 1}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "guardient-api"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=True)

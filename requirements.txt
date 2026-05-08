@@ -1,0 +1,27 @@
+# Guardient — Full Dependency List
+# Install: pip3 install -r requirements.txt
+
+# ── Web API ───────────────────────────────────────────────
+fastapi>=0.128.0
+uvicorn[standard]>=0.39.0
+python-dotenv>=1.0.0
+requests>=2.32.0
+
+# ── Kafka Pipeline ────────────────────────────────────────
+kafka-python>=2.3.0
+
+# ── System Monitoring ─────────────────────────────────────
+psutil>=7.2.0
+geoip2>=4.8.0
+
+# ── GCP Cloud Collector ───────────────────────────────────
+google-cloud-logging>=3.13.0
+google-cloud-monitoring>=2.29.0
+google-api-python-client>=2.190.0
+google-auth>=2.48.0
+
+# ── Network Collector ─────────────────────────────────────
+scapy>=2.6.0
+twilio>=8.0.0
+python-dotenv>=1.0.0
+secure-smtplib
