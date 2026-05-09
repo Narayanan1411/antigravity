@@ -119,6 +119,8 @@ class FeatureEngine(BaseConsumer):
             },
             "enrichment": {"geo": event.get("geo_destination"), "asn": event.get("destination_asn")},
             "features":   features,
+            "ml_anomaly_score": event.get("ml_anomaly_score"),
+            "ml_is_anomaly": event.get("ml_is_anomaly"),
         }
         
         publish_event(FEATURE_STREAM, feature_event)

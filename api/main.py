@@ -114,7 +114,44 @@ async def ingest_network(
     _check_key("network", x_api_key)
     body   = await request.json()
     events = events_from_network(body)
-    return _ingest("network", events)
+    
+    # Aggregation for Pipeline — prevents 10x risk inflation from flow batches
+    # We still log ALL individual flows locally for forensics
+    _save_local("network", events)
+    
+    device_summaries = {}
+    for ev in events:
+        did = ev["device_id"]
+        if did not in device_summaries:
+            device_summaries[did] = ev.copy()
+            device_summaries[did]["bytes_sent"] = 0
+            device_summaries[did]["bytes_received"] = 0
+            device_summaries[did]["packet_count"] = 0
+            device_summaries[did]["event_type"] = "network_summary"
+        
+        device_summaries[did]["bytes_sent"] += (ev.get("bytes_sent") or 0)
+        device_summaries[did]["bytes_received"] += (ev.get("bytes_received") or 0)
+        device_summaries[did]["packet_count"] += (ev.get("packet_count") or 0)
+    
+    # Attach root ML scores to the summaries
+    ml_score = body.get("ml_anomaly_score")
+    ml_is_anomaly = body.get("ml_is_anomaly")
+    
+    published = 0
+    for did, summary in device_summaries.items():
+        if ml_score is not None:
+            summary["ml_anomaly_score"] = ml_score
+            summary["ml_is_anomaly"] = ml_is_anomaly
+            
+        if publish_event(RAW_EVENTS, summary):
+            published += 1
+            
+    return {
+        "status": "ok",
+        "events": len(events),
+        "published_summaries": published,
+        "timestamp": datetime.now(tz=timezone.utc).isoformat()
+    }
 
 
 @app.post("/identity/events")

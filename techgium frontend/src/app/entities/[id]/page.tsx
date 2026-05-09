@@ -4,6 +4,7 @@ import { usePolling } from '@/hooks/usePolling';
 import { Entity, AuditLog } from '@/types';
 import { approveResponse } from '@/lib/api';
 import { useParams, useRouter } from 'next/navigation';
+import useSWR from 'swr';
 import {
   ArrowLeft,
   Shield,
@@ -47,19 +48,37 @@ export default function EntityDetailPage() {
     new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
   );
 
-  // Build trust history chart data from trust_history evaluations
-  const trustChartData = useMemo(() => {
-    if (!entity?.trust_history) return [];
-    return entity.trust_history.map((eval_, i) => ({
-      time: i,
-      score: eval_.final_trust_score,
-    }));
-  }, [entity?.trust_history]);
+  // Per-entity deep fetch for live history data
+  const { data: entityDetail } = useSWR(
+    id ? `http://localhost:8000/api/v1/entities/${id}` : null,
+    (url: string) => fetch(url).then(r => r.json()),
+    { refreshInterval: 5000, revalidateOnFocus: false }
+  );
 
-  // Build risk category bar chart data
+  const isWarmup = !entityDetail || (entityDetail?.total_event_count ?? 0) < 100;
+
+  // Build trust history chart data from live detail API
+  const trustChartData = useMemo(() => {
+    const history = entityDetail?.trust_history;
+    if (!history || history.length < 2) return [];
+    return history.map((pt: { time: string; score: number }, i: number) => ({
+      time: i,
+      score: pt.score,
+    }));
+  }, [entityDetail?.trust_history]);
+
+  // Build risk category bar chart data (show zeros during warmup)
   const riskBarData = useMemo(() => {
-    if (!entity?.trust_evaluation?.trust_evaluation) return [];
-    const te = entity.trust_evaluation.trust_evaluation;
+    if (isWarmup) return [
+      { name: 'Network', risk: 0, fill: '#3b82f6' },
+      { name: 'Identity', risk: 0, fill: '#8b5cf6' },
+      { name: 'Cloud', risk: 0, fill: '#06b6d4' },
+      { name: 'Hardware', risk: 0, fill: '#f59e0b' },
+      { name: 'Temporal', risk: 0, fill: '#10b981' },
+    ];
+    const detail = entityDetail || entity;
+    if (!detail?.trust_evaluation?.trust_evaluation) return [];
+    const te = detail.trust_evaluation.trust_evaluation;
     return [
       { name: 'Network', risk: Math.round((te.network?.Rc || 0) * 100), fill: '#3b82f6' },
       { name: 'Identity', risk: Math.round((te.identity?.Rc || 0) * 100), fill: '#8b5cf6' },
@@ -67,7 +86,7 @@ export default function EntityDetailPage() {
       { name: 'Hardware', risk: Math.round((te.hardware?.Rc || 0) * 100), fill: '#f59e0b' },
       { name: 'Temporal', risk: Math.round((te.temporal?.Rc || 0) * 100), fill: '#10b981' },
     ];
-  }, [entity?.trust_evaluation]);
+  }, [entityDetail, entity, isWarmup]);
 
   if (!entity) {
     return <div className="text-gray-400">Loading entity details...</div>;
@@ -149,14 +168,31 @@ export default function EntityDetailPage() {
             )}
             Current TrustScore
           </div>
-          <div className={`text-4xl font-black ${getScoreTextColor(entity.trust_score)}`}>
-            {entity.trust_score}
+          <div className={`text-4xl font-black ${isWarmup ? 'text-green-400' : getScoreTextColor(entityDetail?.trust_score ?? entity.trust_score)}`}>
+            {isWarmup ? '100.0' : (entityDetail?.trust_score ?? entity.trust_score).toFixed(1)}
           </div>
         </div>
       </div>
 
+      {/* ML Warmup Banner */}
+      {isWarmup && (
+        <div className="border border-dashed border-yellow-500/30 bg-yellow-500/5 rounded-lg p-4 flex items-center gap-4">
+          <div className="text-yellow-400 text-xl">⏳</div>
+          <div>
+            <p className="text-sm font-semibold text-yellow-400">ML Warmup in Progress</p>
+            <p className="text-xs text-gray-400 mt-0.5">
+              Collecting baseline data — {entityDetail?.total_event_count ?? 0}/100 events recorded.
+              Trust shows 100 and all category risks show 0 until the ML model has enough data to establish behavioural baselines.
+            </p>
+            <div className="mt-2 h-1.5 bg-white/5 rounded-full overflow-hidden w-64">
+              <div className="h-full bg-yellow-500/60 rounded-full transition-all" style={{ width: `${Math.min(100, ((entityDetail?.total_event_count ?? 0) / 100) * 100)}%` }} />
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Pending Approval Panel */}
-      {showResponsePanel && (
+      {showResponsePanel && !isWarmup && (
         <div className="bg-critical/10 border border-critical/30 rounded-lg p-6 flex items-center justify-between">
           <div className="flex items-center gap-4">
             <div className="p-2 bg-critical/20 rounded-full">
@@ -164,7 +200,7 @@ export default function EntityDetailPage() {
             </div>
             <div>
               <h4 className="font-bold text-white">Pending SOC Approval Required</h4>
-              <p className="text-sm text-gray-400">Entity behavior triggered {entity.decision} state. Confidence: {entity.confidence}%</p>
+              <p className="text-sm text-gray-400">Entity behavior triggered {entityDetail?.decision ?? entity.decision} state. Confidence: {entityDetail?.confidence ?? entity.confidence}%</p>
             </div>
           </div>
           <div className="flex gap-3">
@@ -256,37 +292,37 @@ export default function EntityDetailPage() {
                 <div className="space-y-6">
                   <CategoryScore
                     label="Network Risk"
-                    value={(entity.trust_evaluation?.trust_evaluation?.network?.Rc || 0) * 100}
+                    value={isWarmup ? 0 : (entity.trust_evaluation?.trust_evaluation?.network?.Rc || 0) * 100}
                     delta={entity.trust_evaluation?.trust_evaluation?.network?.delta || 0}
                     signals={entity.trust_evaluation?.trust_evaluation?.network?.signals}
                     icon={Network}
                   />
                   <CategoryScore
                     label="Identity Integrity"
-                    value={(entity.trust_evaluation?.trust_evaluation?.identity?.Rc || 0) * 100}
-                    delta={entity.trust_evaluation?.trust_evaluation?.identity?.delta || 0}
-                    signals={entity.trust_evaluation?.trust_evaluation?.identity?.signals}
+                    value={isWarmup ? 0 : ((entityDetail?.trust_evaluation?.trust_evaluation?.identity?.Rc ?? entity.trust_evaluation?.trust_evaluation?.identity?.Rc) || 0) * 100}
+                    delta={(entityDetail?.trust_evaluation?.trust_evaluation?.identity?.delta ?? entity.trust_evaluation?.trust_evaluation?.identity?.delta) || 0}
+                    signals={entityDetail?.trust_evaluation?.trust_evaluation?.identity?.signals ?? entity.trust_evaluation?.trust_evaluation?.identity?.signals}
                     icon={User}
                   />
                   <CategoryScore
                     label="Cloud Posture"
-                    value={(entity.trust_evaluation?.trust_evaluation?.cloud?.Rc || 0) * 100}
-                    delta={entity.trust_evaluation?.trust_evaluation?.cloud?.delta || 0}
-                    signals={entity.trust_evaluation?.trust_evaluation?.cloud?.signals}
+                    value={isWarmup ? 0 : ((entityDetail?.trust_evaluation?.trust_evaluation?.cloud?.Rc ?? entity.trust_evaluation?.trust_evaluation?.cloud?.Rc) || 0) * 100}
+                    delta={(entityDetail?.trust_evaluation?.trust_evaluation?.cloud?.delta ?? entity.trust_evaluation?.trust_evaluation?.cloud?.delta) || 0}
+                    signals={entityDetail?.trust_evaluation?.trust_evaluation?.cloud?.signals ?? entity.trust_evaluation?.trust_evaluation?.cloud?.signals}
                     icon={Cloud}
                   />
                   <CategoryScore
                     label="Hardware Security"
-                    value={(entity.trust_evaluation?.trust_evaluation?.hardware?.Rc || 0) * 100}
-                    delta={entity.trust_evaluation?.trust_evaluation?.hardware?.delta || 0}
-                    signals={entity.trust_evaluation?.trust_evaluation?.hardware?.signals}
+                    value={isWarmup ? 0 : ((entityDetail?.trust_evaluation?.trust_evaluation?.hardware?.Rc ?? entity.trust_evaluation?.trust_evaluation?.hardware?.Rc) || 0) * 100}
+                    delta={(entityDetail?.trust_evaluation?.trust_evaluation?.hardware?.delta ?? entity.trust_evaluation?.trust_evaluation?.hardware?.delta) || 0}
+                    signals={entityDetail?.trust_evaluation?.trust_evaluation?.hardware?.signals ?? entity.trust_evaluation?.trust_evaluation?.hardware?.signals}
                     icon={Cpu}
                   />
                   <CategoryScore
                     label="Temporal Stability"
-                    value={(entity.trust_evaluation?.trust_evaluation?.temporal?.Rc || 0) * 100}
-                    delta={entity.trust_evaluation?.trust_evaluation?.temporal?.delta || 0}
-                    signals={entity.trust_evaluation?.trust_evaluation?.temporal?.signals}
+                    value={isWarmup ? 0 : ((entityDetail?.trust_evaluation?.trust_evaluation?.temporal?.Rc ?? entity.trust_evaluation?.trust_evaluation?.temporal?.Rc) || 0) * 100}
+                    delta={(entityDetail?.trust_evaluation?.trust_evaluation?.temporal?.delta ?? entity.trust_evaluation?.trust_evaluation?.temporal?.delta) || 0}
+                    signals={entityDetail?.trust_evaluation?.trust_evaluation?.temporal?.signals ?? entity.trust_evaluation?.trust_evaluation?.temporal?.signals}
                     icon={Clock}
                   />
                 </div>
@@ -303,9 +339,9 @@ export default function EntityDetailPage() {
                         </div>
                       </div>
                     </div>
-                    <div className="text-5xl font-bold text-white mb-2">{entity.confidence}%</div>
+                    <div className="text-5xl font-bold text-white mb-2">{isWarmup ? 100 : (entityDetail?.confidence ?? entity.confidence)}%</div>
                     <div className="w-full bg-white/10 h-2 rounded-full mt-4 overflow-hidden">
-                      <div className="bg-primary h-full transition-all duration-500" style={{ width: `${entity.confidence}%` }} />
+                      <div className="bg-primary h-full transition-all duration-500" style={{ width: `${isWarmup ? 100 : (entityDetail?.confidence ?? entity.confidence)}%` }} />
                     </div>
                   </div>
 

@@ -7,7 +7,16 @@ from __future__ import annotations
 import json
 import signal
 import sys
-from kafka import KafkaConsumer as _KafkaConsumer
+
+KAFKA_AVAILABLE = False
+_KafkaConsumer = None
+
+try:
+    from kafka import KafkaConsumer as _KafkaConsumer
+    KAFKA_AVAILABLE = True
+except ImportError:
+    print("[Kafka] Warning: kafka-python not installed, consumer disabled")
+    KAFKA_AVAILABLE = False
 
 BOOTSTRAP = "localhost:9092"
 
@@ -23,6 +32,11 @@ class BaseConsumer:
     service_name: str = ""   # for logging
 
     def __init__(self):
+        if not KAFKA_AVAILABLE:
+            print(f"[{self.service_name}] Kafka not available, consumer disabled")
+            self._consumer = None
+            return
+        
         self._consumer = _KafkaConsumer(
             self.topic,
             bootstrap_servers=BOOTSTRAP,
@@ -39,6 +53,12 @@ class BaseConsumer:
         raise NotImplementedError
 
     def run(self):
+        if not KAFKA_AVAILABLE or self._consumer is None:
+            print(f"[{self.service_name}] Kafka not available, consumer disabled")
+            import time
+            while True:
+                time.sleep(1)
+        
         print(f"[{self.service_name}] Listening on '{self.topic}'  (Ctrl+C to stop)")
         try:
             for msg in self._consumer:
@@ -49,9 +69,11 @@ class BaseConsumer:
         except Exception as exc:
             print(f"[{self.service_name}] Consumer error: {exc}")
         finally:
-            self._consumer.close()
+            if self._consumer:
+                self._consumer.close()
 
     def _shutdown(self, *_):
         print(f"\n[{self.service_name}] Shutting down.")
-        self._consumer.close()
+        if self._consumer:
+            self._consumer.close()
         sys.exit(0)

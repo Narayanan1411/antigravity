@@ -74,7 +74,7 @@ DETECTION_CATEGORY: dict[str, str] = {
     "large_clock_skew":           "V",
     "clock_skew":                 "V",
     "cpu_spike":                  "V",
-    "behavior_anomaly":           "V",
+    # "behavior_anomaly":           "V", # Moved to fallback logic in compute_risk
     "device_drift":               "V",
     "above_avg_transfer":         "V",
     # Network
@@ -214,7 +214,8 @@ def compute_risk(
 
     # 3. Category from detection (I / C / V / N)
     category = DETECTION_CATEGORY.get(detection) or {
-        "identity": "I", "cloud": "C", "hardware": "V", "network": "N"
+        "identity": "I", "cloud": "C", "hardware": "V", "network": "N",
+        "hardware_lstm": "V", "network_discovery": "N"
     }.get(source, "N")
 
     # 4. Anomaly — normalise Welford z-score via tanh: z=1→0.76, z=2→0.96

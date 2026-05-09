@@ -172,6 +172,45 @@ CREATE TABLE IF NOT EXISTS response_actions (
     action          TEXT,
     triggered_at    TIMESTAMPTZ
 );
+
+-- ── Response Executor (new system) ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS response_executions (
+    execution_id      TEXT PRIMARY KEY,
+    device_id         TEXT NOT NULL,
+    action            TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'pending',
+    triggered_by      TEXT NOT NULL DEFAULT 'system',
+    trust_score       FLOAT,
+    risk_score        FLOAT,
+    severity          TEXT,
+    requires_approval BOOLEAN NOT NULL DEFAULT FALSE,
+    approved_by       TEXT,
+    rejected_by       TEXT,
+    rejection_reason  TEXT,
+    description       TEXT,
+    metadata          JSONB NOT NULL DEFAULT '{}',
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    executed_at       TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_re_device   ON response_executions(device_id);
+CREATE INDEX IF NOT EXISTS idx_re_status   ON response_executions(status);
+CREATE INDEX IF NOT EXISTS idx_re_created  ON response_executions(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS device_blocks (
+    block_id        TEXT PRIMARY KEY,
+    device_id       TEXT NOT NULL UNIQUE,
+    action          TEXT NOT NULL DEFAULT 'block_device',
+    reason          TEXT,
+    blocked_by      TEXT NOT NULL DEFAULT 'system',
+    unblocked_by    TEXT,
+    blocked_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    unblocked_at    TIMESTAMPTZ,
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+CREATE INDEX IF NOT EXISTS idx_db_active ON device_blocks(device_id) WHERE is_active = TRUE;
 """
 
 
@@ -499,6 +538,255 @@ def get_response_actions(limit=50) -> list:
         conn.rollback()
         print(f"[DB] get_response_actions error: {exc}")
         return []
+    finally:
+        put_conn(conn)
+
+
+# ── Response Executor DB helpers ─────────────────────────────────────────────
+
+def insert_response_execution(record: dict):
+    """Insert a new execution record. Called by ResponseExecutor.execute()."""
+    execute("""
+        INSERT INTO response_executions (
+            execution_id, device_id, action, status, triggered_by,
+            trust_score, risk_score, severity, requires_approval,
+            approved_by, rejected_by, rejection_reason, description,
+            metadata, created_at, updated_at, executed_at
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (execution_id) DO NOTHING
+    """, (
+        record["execution_id"], record["device_id"], record["action"],
+        record["status"], record["triggered_by"],
+        record.get("trust_score"), record.get("risk_score"), record.get("severity"),
+        record.get("requires_approval", False),
+        record.get("approved_by"), record.get("rejected_by"),
+        record.get("rejection_reason"), record.get("description"),
+        Json(record.get("metadata", {})),
+        record.get("created_at"), record.get("updated_at"), record.get("executed_at"),
+    ))
+
+
+def update_execution_status(
+    execution_id: str,
+    status: str,
+    approved_by: Optional[str] = None,
+    rejected_by: Optional[str] = None,
+    rejection_reason: Optional[str] = None,
+    executed_at: Optional[str] = None,
+    metadata_extra: Optional[dict] = None,
+):
+    """Update status + optional fields on an execution record."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE response_executions SET
+                    status           = %s,
+                    updated_at       = NOW(),
+                    approved_by      = COALESCE(%s, approved_by),
+                    rejected_by      = COALESCE(%s, rejected_by),
+                    rejection_reason = COALESCE(%s, rejection_reason),
+                    executed_at      = COALESCE(%s::TIMESTAMPTZ, executed_at),
+                    metadata         = CASE
+                                         WHEN %s::JSONB IS NOT NULL
+                                         THEN metadata || %s::JSONB
+                                         ELSE metadata
+                                       END
+                WHERE execution_id = %s
+            """, (
+                status,
+                approved_by, rejected_by, rejection_reason,
+                executed_at,
+                Json(metadata_extra) if metadata_extra else None,
+                Json(metadata_extra) if metadata_extra else None,
+                execution_id,
+            ))
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        print(f"[DB] update_execution_status error: {exc}")
+    finally:
+        put_conn(conn)
+
+
+def get_execution(execution_id: str) -> Optional[dict]:
+    """Fetch a single execution record by ID."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT execution_id, device_id, action, status, triggered_by,
+                       trust_score, risk_score, severity, requires_approval,
+                       approved_by, rejected_by, rejection_reason, description,
+                       metadata, created_at, updated_at, executed_at
+                FROM response_executions
+                WHERE execution_id = %s
+            """, (execution_id,))
+            row = cur.fetchone()
+        if not row:
+            return None
+        cols = [
+            "execution_id","device_id","action","status","triggered_by",
+            "trust_score","risk_score","severity","requires_approval",
+            "approved_by","rejected_by","rejection_reason","description",
+            "metadata","created_at","updated_at","executed_at",
+        ]
+        rec = dict(zip(cols, row))
+        for ts_field in ("created_at", "updated_at", "executed_at"):
+            if rec.get(ts_field) and hasattr(rec[ts_field], "isoformat"):
+                rec[ts_field] = rec[ts_field].isoformat()
+        return rec
+    except Exception as exc:
+        conn.rollback()
+        print(f"[DB] get_execution error: {exc}")
+        return None
+    finally:
+        put_conn(conn)
+
+
+def list_response_executions(
+    device_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 200,
+) -> list:
+    """List execution records, optionally filtered by device and/or status."""
+    conn = get_conn()
+    try:
+        filters, params = [], []
+        if device_id:
+            filters.append("device_id = %s"); params.append(device_id)
+        if status:
+            filters.append("status = %s"); params.append(status)
+        where = ("WHERE " + " AND ".join(filters)) if filters else ""
+        params.append(limit)
+
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT execution_id, device_id, action, status, triggered_by,
+                       trust_score, risk_score, severity, requires_approval,
+                       approved_by, rejected_by, rejection_reason, description,
+                       metadata, created_at, updated_at, executed_at
+                FROM response_executions
+                {where}
+                ORDER BY created_at DESC
+                LIMIT %s
+            """, params)
+            cols = [
+                "execution_id","device_id","action","status","triggered_by",
+                "trust_score","risk_score","severity","requires_approval",
+                "approved_by","rejected_by","rejection_reason","description",
+                "metadata","created_at","updated_at","executed_at",
+            ]
+            rows = []
+            for row in cur.fetchall():
+                rec = dict(zip(cols, row))
+                for ts_field in ("created_at", "updated_at", "executed_at"):
+                    if rec.get(ts_field) and hasattr(rec[ts_field], "isoformat"):
+                        rec[ts_field] = rec[ts_field].isoformat()
+                rows.append(rec)
+        return rows
+    except Exception as exc:
+        conn.rollback()
+        print(f"[DB] list_response_executions error: {exc}")
+        return []
+    finally:
+        put_conn(conn)
+
+
+def upsert_device_block(device_id: str, action: str, blocked_by: str):
+    """Register or refresh a device block in the device_blocks table."""
+    import uuid as _uuid
+    block_id = f"BLK-{device_id[:8]}-{_uuid.uuid4().hex[:6]}"
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO device_blocks (block_id, device_id, action, blocked_by, blocked_at, is_active)
+                VALUES (%s, %s, %s, %s, NOW(), TRUE)
+                ON CONFLICT (device_id) DO UPDATE
+                    SET block_id     = EXCLUDED.block_id,
+                        action       = EXCLUDED.action,
+                        blocked_by   = EXCLUDED.blocked_by,
+                        blocked_at   = NOW(),
+                        unblocked_by = NULL,
+                        unblocked_at = NULL,
+                        is_active    = TRUE
+            """, (block_id, device_id, action, blocked_by))
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        print(f"[DB] upsert_device_block error: {exc}")
+    finally:
+        put_conn(conn)
+
+
+def remove_device_block(device_id: str, unblocked_by: str):
+    """Mark a device block as inactive (unblocked)."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE device_blocks
+                SET is_active    = FALSE,
+                    unblocked_by = %s,
+                    unblocked_at = NOW()
+                WHERE device_id = %s AND is_active = TRUE
+            """, (unblocked_by, device_id))
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        print(f"[DB] remove_device_block error: {exc}")
+    finally:
+        put_conn(conn)
+
+
+def list_device_blocks(active_only: bool = True) -> list:
+    """List all device blocks, optionally only active ones."""
+    conn = get_conn()
+    try:
+        where = "WHERE is_active = TRUE" if active_only else ""
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT block_id, device_id, action, reason, blocked_by,
+                       unblocked_by, blocked_at, unblocked_at, is_active
+                FROM device_blocks
+                {where}
+                ORDER BY blocked_at DESC
+                LIMIT 500
+            """)
+            cols = [
+                "block_id","device_id","action","reason","blocked_by",
+                "unblocked_by","blocked_at","unblocked_at","is_active",
+            ]
+            rows = []
+            for row in cur.fetchall():
+                rec = dict(zip(cols, row))
+                for ts_field in ("blocked_at", "unblocked_at"):
+                    if rec.get(ts_field) and hasattr(rec[ts_field], "isoformat"):
+                        rec[ts_field] = rec[ts_field].isoformat()
+                rows.append(rec)
+        return rows
+    except Exception as exc:
+        conn.rollback()
+        print(f"[DB] list_device_blocks error: {exc}")
+        return []
+    finally:
+        put_conn(conn)
+
+
+def is_device_blocked(device_id: str) -> bool:
+    """Quick check: is this device currently in an active block?"""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM device_blocks WHERE device_id = %s AND is_active = TRUE LIMIT 1",
+                (device_id,)
+            )
+            return cur.fetchone() is not None
+    except Exception as exc:
+        conn.rollback()
+        return False
     finally:
         put_conn(conn)
 

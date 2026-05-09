@@ -24,6 +24,7 @@ import random
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
+from collections import deque
 import psutil
 import socket
 import requests
@@ -32,6 +33,13 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 ML_ENABLED = False
+device_buffers = {}  # Will be defaultdict from imported app.py
+device_models = {}
+train_device_model = None
+detect_anomaly = None
+build_feature_vector = None
+SEQ_LEN = 30
+
 try:
     NEW_WORK_ROOT = ROOT.parent / "new_work"
     if NEW_WORK_ROOT.exists():
@@ -40,11 +48,16 @@ try:
             Flow as MLFlow,
             SEQ_LEN,
             build_feature_vector,
-            device_buffers,
-            device_models,
-            train_device_model,
-            detect_anomaly,
+            device_buffers as imported_device_buffers,
+            device_models as imported_device_models,
+            train_device_model as imported_train_device_model,
+            detect_anomaly as imported_detect_anomaly,
         )
+        # Use the imported defaultdict directly
+        device_buffers = imported_device_buffers
+        device_models = imported_device_models
+        train_device_model = imported_train_device_model
+        detect_anomaly = imported_detect_anomaly
         ML_ENABLED = True
     else:
         print(f"[Discovery] ML model directory not found: {NEW_WORK_ROOT}")
@@ -59,7 +72,8 @@ from db.db import get_conn, put_conn
 from api.device_resolver import resolve_device, lookup_alias, store_device_and_aliases
 
 # Configuration
-INTERFACE = "wlp1s0"  # Update this to match your wireless interface (run 'ip link show')  # Update this to match your interface
+INTERFACE = os.getenv("NETWORK_INTERFACE", None)
+DEFAULT_INTERFACES = ("wlp1s0", "eth0", "enp0s3", "enp0s8", "enp1s0", "en0")
 LOCAL_IP_MASK = None
 flows = {}
 lock = threading.Lock()
@@ -71,17 +85,55 @@ device_type_cache = {}  # MAC -> device_type for consistency
 # User authentication cache
 authenticated_devices = set()
 
+def ensure_device_buffer(mac: str):
+    """Ensure device buffer exists for this MAC address."""
+    # device_buffers is a defaultdict, so just accessing it creates the buffer
+    if ML_ENABLED:
+        _ = device_buffers[mac]  # Access to trigger defaultdict creation
+        print(f"[Discovery] Initialized buffer for device {mac}")
+
+def detect_interface() -> str:
+    """Find the best local network interface to capture traffic from."""
+    if INTERFACE:
+        return INTERFACE
+
+    interfaces = psutil.net_if_addrs()
+    for candidate in DEFAULT_INTERFACES:
+        if candidate in interfaces:
+            return candidate
+
+    for iface, addrs in interfaces.items():
+        if iface.startswith(("lo", "docker", "veth", "br-", "virbr", "tun", "tap")):
+            continue
+        if any(addr.family == socket.AF_INET for addr in addrs):
+            return iface
+
+    return ""
+
+
 def get_auto_mask(iface):
     """Dynamically detects the local network prefix."""
-    try:
-        addr_dict = psutil.net_if_addrs()
-        if iface in addr_dict:
-            for snic in addr_dict[iface]:
-                if snic.family == socket.AF_INET:
-                    return ".".join(snic.address.split(".")[:3]) + "."
-    except Exception as e:
-        print(f"[Discovery] Mask detection failed: {e}")
-    return "192.168.1."
+    if not iface:
+        return ""
+
+    addrs = psutil.net_if_addrs().get(iface, [])
+    for addr in addrs:
+        if addr.family == socket.AF_INET:
+            octets = addr.address.split(".")
+            if len(octets) == 4:
+                if octets[0] == "10":
+                    return "10."
+                if octets[0] == "192" and octets[1] == "168":
+                    return "192.168."
+                if octets[0] == "172":
+                    return f"{octets[0]}.{octets[1]}."
+                return f"{octets[0]}.{octets[1]}."
+    return ""
+
+
+# Auto-detect the capture interface when not explicitly configured
+INTERFACE = detect_interface()
+
 
 def get_consistent_device_type(mac: str) -> str:
     """Get consistent random device type for a MAC address."""
@@ -202,6 +254,7 @@ def parse_packet(packet):
 
                 if prompt_user_authentication(device_info):
                     authenticated_devices.add(device_mac)
+                    ensure_device_buffer(device_mac)
                     update_device_database(device_info)
 
         f = flows[flow_key]
@@ -216,13 +269,16 @@ def parse_packet(packet):
 
 def process_flow_for_ml(flow_data: dict):
     """Convert a network flow to the LSTM model input and run training/detection."""
-    if not ML_ENABLED:
+    if not ML_ENABLED or not build_feature_vector:
         return None
 
     mac = flow_data.get("device_mac") or flow_data.get("mac_address")
     if not mac:
         return None
 
+    # Ensure buffer exists for this device
+    ensure_device_buffer(mac)
+    
     try:
         ml_flow = MLFlow(
             device_ip=flow_data.get("source_ip") or flow_data.get("device_ip", ""),
@@ -240,21 +296,33 @@ def process_flow_for_ml(flow_data: dict):
         print(f"[Discovery] ML flow conversion failed: {exc}")
         return None
 
-    feature_vector = build_feature_vector([ml_flow])
-    device_buffers[mac].append(feature_vector)
+    try:
+        feature_vector = build_feature_vector([ml_flow])
+        device_buffers[mac].append(feature_vector)
+    except Exception as exc:
+        print(f"[Discovery] Feature extraction error: {exc}")
+        return None
 
     if len(device_buffers[mac]) < SEQ_LEN:
         print(f"[Discovery] ML collecting {len(device_buffers[mac])}/{SEQ_LEN} for {mac}")
         return None
 
     if mac not in device_models:
-        train_device_model(mac, [list(device_buffers[mac])])
-        return {"status": "model_trained", "mac": mac}
+        try:
+            train_device_model(mac, list(device_buffers[mac]))
+            return {"status": "model_trained", "mac": mac}
+        except Exception as exc:
+            print(f"[Discovery] Model training error: {exc}")
+            return None
 
-    result = detect_anomaly(mac, list(device_buffers[mac]))
-    if result.get("anomaly"):
-        print(f"[Discovery] ML anomaly detected for {mac}: score={result.get('score')} threshold={result.get('threshold')}")
-    return result
+    try:
+        result = detect_anomaly(mac, list(device_buffers[mac]))
+        if result and result.get("anomaly"):
+            print(f"[Discovery] Network anomaly detected for {mac}: score={result.get('score'):.4f} threshold={result.get('threshold'):.4f}")
+        return result
+    except Exception as exc:
+        print(f"[Discovery] Anomaly detection error: {exc}")
+        return None
 
 
 def start_tshark():
@@ -280,7 +348,7 @@ def start_tshark():
 def send_network_events():
     """Send accumulated network events to the pipeline."""
     while True:
-        time.sleep(30)  # Send every 30 seconds
+        time.sleep(3)  # Send every 3 seconds for real-time updates
 
         with lock:
             current_flows = list(flows.values())
@@ -289,42 +357,68 @@ def send_network_events():
         if not current_flows:
             continue
 
-        for flow in current_flows:
-            # Create network event in the format expected by the API
+        # Group flows by device mac so we don't spam the API with 50+ individual requests
+        device_groups = {}
+        for f in current_flows:
+            mac = f["device_mac"]
+            if mac not in device_groups:
+                device_groups[mac] = []
+            device_groups[mac].append(f)
+
+        for mac, dev_flows in device_groups.items():
+            # Send top 10 flows by bytes to keep packet size sane and avoid trust inflation
+            top_flows = sorted(dev_flows, key=lambda x: x["bytes_sent"] + x["bytes_received"], reverse=True)[:10]
+            
+            # Combine all flows for this device into one API call
             event = {
-                "flows": [{
+                "flows": []
+            }
+            
+            # Aggregate stats for the ML model input
+            total_bytes_sent = 0
+            total_bytes_received = 0
+            total_packets = 0
+            
+            for flow in top_flows:
+                event["flows"].append({
                     "source_ip": flow["device_ip"],
                     "destination_ip": flow["remote_ip"],
                     "source_port": int(flow["device_port"]) if flow["device_port"] else 0,
                     "destination_port": int(flow["remote_port"]) if flow["remote_port"] else 0,
                     "mac_address": flow["device_mac"],
-                    "hostname": None,  # We don't have hostname from network
+                    "hostname": None,
                     "device_type": get_consistent_device_type(flow["device_mac"]),
-                    "os": None,  # We don't have OS info from network
+                    "os": None,
                     "dns_query_name": flow["dns_query"],
                     "tls_sni": None,
                     "bytes_sent": flow["bytes_sent"],
                     "bytes_received": flow["bytes_received"],
-                    "session_duration": 30.0,  # Approximation
+                    "session_duration": 3.0,
                     "packet_count": flow["packet_count"],
                     "timestamp": datetime.now(timezone.utc).isoformat(),
-                }]
-            }
+                })
+                total_bytes_sent += flow["bytes_sent"]
+                total_bytes_received += flow["bytes_received"]
+                total_packets += flow["packet_count"]
 
+            # Run ML anomaly detection on the aggregate for this device
+            first_flow = top_flows[0]
             ml_result = process_flow_for_ml({
-                "device_ip": flow["device_ip"],
-                "remote_ip": flow["remote_ip"],
-                "device_mac": flow["device_mac"],
-                "device_port": flow["device_port"],
-                "remote_port": flow["remote_port"],
-                "bytes_sent": flow["bytes_sent"],
-                "bytes_received": flow["bytes_received"],
-                "packet_count": flow["packet_count"],
-                "dns_query": flow["dns_query"],
+                "device_ip": first_flow["device_ip"],
+                "remote_ip": "aggregate", # Use aggregate for ML context
+                "device_mac": mac,
+                "device_port": 0,
+                "remote_port": 0,
+                "bytes_sent": total_bytes_sent,
+                "bytes_received": total_bytes_received,
+                "packet_count": total_packets,
+                "dns_query": first_flow["dns_query"],
                 "timestamp": event["flows"][0]["timestamp"],
             })
+
             if ml_result:
-                print(f"[Discovery] ML result for {flow['device_mac']}: {ml_result}")
+                event["ml_anomaly_score"] = ml_result.get("score", 0.0)
+                event["ml_is_anomaly"] = ml_result.get("anomaly", False)
 
             # Send to API
             try:

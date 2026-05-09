@@ -77,3 +77,70 @@ export interface ApprovalRequest {
   approved_by?: string;
 }
 
+// ── Response Executor types ───────────────────────────────────────────────────
+
+export type ExecutionStatus = 'pending' | 'running' | 'success' | 'failed' | 'rejected';
+
+export interface ResponseExecution {
+  execution_id: string;
+  device_id: string;
+  action: string;
+  status: ExecutionStatus;
+  triggered_by: string;
+  trust_score: number | null;
+  risk_score: number | null;
+  severity: string | null;
+  requires_approval: boolean;
+  approved_by: string | null;
+  rejected_by: string | null;
+  rejection_reason: string | null;
+  description: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+  executed_at: string | null;
+}
+
+export interface DeviceBlock {
+  block_id: string;
+  device_id: string;
+  action: string;
+  reason: string | null;
+  blocked_by: string;
+  unblocked_by: string | null;
+  blocked_at: string;
+  unblocked_at: string | null;
+  is_active: boolean;
+}
+
+export interface BlockRequest {
+  device_id: string;
+  reason?: string;
+  blocked_by?: string;
+}
+
+export interface UnblockRequest {
+  device_id: string;
+  unblocked_by?: string;
+}
+
+export interface ManualExecuteRequest {
+  device_id: string;
+  action: string;
+  triggered_by?: string;
+  trust_score?: number;
+  risk_score?: number;
+  severity?: string;
+  auto_approve?: boolean;
+  metadata?: Record<string, unknown>;
+}
+
+export interface ExecutionApprovalRequest {
+  approver?: string;
+}
+
+export interface ExecutionRejectRequest {
+  rejector?: string;
+  reason?: string;
+}
+

@@ -43,26 +43,26 @@ from db.db import insert_trust_score, load_trust_state, save_trust_state, init_s
 # ──────────────────────────────────────────────────────────────
 
 BASE_LAMBDA: dict[str, float] = {
-    "I": 0.002,   # Identity
-    "C": 0.002,   # Cloud
-    "V": 0.002,   # Vulnerability / Hardware
-    "N": 0.002,   # Network
+    "I": 0.05,   # Identity
+    "C": 0.05,   # Cloud
+    "V": 0.05,   # Vulnerability / Hardware
+    "N": 0.20,   # Network — fast decay because traffic is bursty
 }
 
 # Multiplier per device type — slower decay = anomaly persists longer
 DEVICE_DECAY: dict[str, float] = {
-    "server":           0.4,   # Servers: retain anomaly very long
-    "domain_controller":0.3,
-    "network_device":   0.5,
-    "laptop":           1.0,   # Standard
-    "workstation":      1.0,
-    "phone":            1.2,   # Mobile: faster decay
-    "mobile":           1.2,
-    "iot":              0.7,   # IoT: slow decay — hard to patch
-    "smart_tv":         0.8,
-    "printer":          0.8,
-    "camera":           0.7,
-    "unknown":          1.0,
+    "server":           0.6,
+    "domain_controller":0.4,
+    "network_device":   0.8,
+    "laptop":           2.0,   # User devices recover 2x faster
+    "workstation":      2.0,
+    "phone":            2.5,   # Mobile recovers 2.5x faster
+    "mobile":           2.5,
+    "iot":              0.9,
+    "smart_tv":         1.0,
+    "printer":          1.0,
+    "camera":           0.8,
+    "unknown":          1.5,
 }
 
 # ──────────────────────────────────────────────────────────────
@@ -188,9 +188,11 @@ def adaptive_lambda(category: str, device_type: str, anomaly: float) -> float:
     """λ = BASE × device_decay_factor × (1 + anomaly)
     High anomaly → slower decay → threat persists in memory.
     """
-    base   = BASE_LAMBDA.get(category, 0.002)
+    base   = BASE_LAMBDA.get(category, 0.05)
     d_fact = DEVICE_DECAY.get(device_type, 1.0)
-    return base * d_fact * (1.0 + anomaly)
+    # Corrected: lambda = base / (1 + anomaly)
+    # High anomaly -> small lambda -> slow decay -> threat persists.
+    return (base * d_fact) / (1.0 + anomaly)
 
 
 def apply_decay(prev_risk: float, lam: float, dt: float) -> float:
@@ -212,12 +214,17 @@ def update_category_risk(category: str, state: dict, events: list[dict],
     lam    = adaptive_lambda(category, device_type, max_an)
     decayed = apply_decay(prev, lam, dt)
 
+    # Only add contributions if they are significant (>0.01) to filter out INFO noise
     total = 0.0
     for e in events:
-        total += event_contribution(
-            e["severity"], e["anomaly"], e["confidence"], e["impact"]
-        )
-    return decayed + total
+        contrib = event_contribution(e["severity"], e["anomaly"], e["confidence"], e["impact"])
+        if contrib > 0.01:
+            total += contrib
+    
+    res = decayed + total
+    # Clamp to a sane range to prevent runaway values during bursts
+    # A single category risk of 10.0 is already effectively 100% trust loss
+    return min(10.0, res)
 
 # ──────────────────────────────────────────────────────────────
 # Step 2-7
@@ -366,11 +373,16 @@ class TrustEngine(BaseConsumer):
         category    = CATEGORY_MAP.get(source, "N")
         device_type = classify_device(event)
 
-        # Build event contribution dict for the pipeline
-        severity   = SOURCE_SEVERITY.get(source, 0.85)
-        anomaly    = float(event.get("anomaly_score", 0.0))
-        confidence = float(min(1.0, math.tanh(max(anomaly, 0.1) * 1.5)))
-        impact     = min(1.0, DEVICE_IMPACT.get(device_type, 0.8))
+        # Build event contribution dict for the pipeline using RiskEngine's outputs
+        # This ensures normalized scores (tanh) are used instead of raw z-scores.
+        rf = event.get("risk_factors", {})
+        
+        # If RiskEngine didn't provide factors (unlikely but safe), fall back to defaults
+        severity   = float(rf.get("severity")   or SOURCE_SEVERITY.get(source, 0.85))
+        anomaly    = float(rf.get("anomaly")    or min(1.0, float(event.get("anomaly_score", 0.0))))
+        confidence = float(rf.get("confidence") or min(1.0, math.tanh(max(anomaly, 0.1) * 1.5)))
+        impact     = float(rf.get("impact")     or min(1.0, DEVICE_IMPACT.get(device_type, 0.8)))
+        category   = rf.get("category")         or CATEGORY_MAP.get(source, "N")
 
         contrib = {
             "category":   category,
@@ -380,6 +392,10 @@ class TrustEngine(BaseConsumer):
             "impact":     impact,
             "risk_score": event.get("risk_score", 0),
         }
+        
+        if anomaly > 0.1:
+            print(f"[Trust] DEBUG dev={device_id} cat={category} sev={severity:.2f} anom={anomaly:.2f} conf={confidence:.2f} imp={impact:.2f} -> contrib={event_contribution(severity, anomaly, confidence, impact):.4f}")
+
 
         # Load persisted state
         state = load_trust_state(device_id)

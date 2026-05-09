@@ -25,7 +25,12 @@ from pydantic import BaseModel
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-from db.db import get_conn, put_conn, get_simulation_runs, get_response_actions
+from db.db import (
+    get_conn, put_conn, get_simulation_runs, get_response_actions,
+    list_response_executions, list_device_blocks, get_execution,
+)
+from response_executor.executor import get_executor
+from response_executor.models import ALL_ACTIONS
 
 router = APIRouter()
 
@@ -131,8 +136,16 @@ def _trust_to_decision(trust: float) -> dict:
     return     {"decision": "emergency", "active_actions": ["lock_account"],      "approval_required": True}
 
 
+def _normalize_risk_score(v) -> float:
+    """Standardized tanh normalization: 1.0 risk -> ~32%, 3.0 -> ~76%, 8.0+ -> ~100%."""
+    import math as _m
+    val = float(v or 0)
+    if val <= 0: return 0.0
+    return round(float(_m.tanh(val / 3.0)), 4)
+
 def _pct(v) -> float:
-    return round(min(100.0, float(v or 0) * 100), 1)
+    """Used for legacy percentage displays."""
+    return round(_normalize_risk_score(v) * 100, 1)
 
 
 def _build_category_breakdown(state: dict) -> dict:
@@ -155,7 +168,8 @@ def _build_trust_evaluation(device_id: str, trust: float, adj: float,
     v = float(state.get("V", 0) or 0)
 
     def _cat(rc, signals):
-        return {"weight": 0.25, "Rc": round(float(rc), 4), "delta": 0.0, "signals": signals}
+        norm_rc = _normalize_risk_score(rc)
+        return {"weight": 0.25, "Rc": norm_rc, "delta": 0.0, "signals": signals}
 
     ts_str = ts.isoformat() if hasattr(ts, "isoformat") else str(ts or "")
 
@@ -220,9 +234,12 @@ def get_entities():
                     ORDER BY timestamp DESC
                     LIMIT 1
                 ) ts ON true
-                LEFT JOIN trust_states tst ON tst.device_id = d.device_id
-                ORDER BY d.last_seen DESC NULLS LAST
-                LIMIT 500
+                    LEFT JOIN trust_states tst ON tst.device_id = d.device_id
+                    LEFT JOIN LATERAL (
+                        SELECT COUNT(*) as cnt FROM trust_scores WHERE device_id = d.device_id
+                    ) ec ON true
+                    ORDER BY d.last_seen DESC NULLS LAST
+                    LIMIT 500
             """)
             rows = [dict(zip([d[0] for d in cur.description], r))
                     for r in cur.fetchall()]
@@ -250,18 +267,27 @@ def get_entities():
                 device_id, trust, adj, state, ts_val
             )
 
-            ts_str = datetime.now(timezone.utc).isoformat()
+            ts_str = ts_val.isoformat() if hasattr(ts_val, "isoformat") else str(ts_val or "")
+
+            event_count = row.get("cnt") or 0
+            if event_count < 100:
+                trust = 100.0
+                confidence = 100.0
+                cat_bd = {k: 0.0 for k in cat_bd}
+                # Re-build te with 100/0 for warmup
+                te = _build_trust_evaluation(device_id, 100.0, 0.0, {k:0.0 for k in state}, ts_val)
 
             entities.append({
                 "entity_id":         row["device_id"],
                 "trust_score":       round(trust, 1),
                 "confidence":        confidence,
-                "decision":          dec["decision"],
+                "decision":          "trusted" if event_count < 100 else dec["decision"],
                 "category_breakdown": cat_bd,
                 "last_updated":      ts_str,
-                "active_actions":    dec["active_actions"],
-                "last_action":       dec["active_actions"][0] if dec["active_actions"] else None,
-                "approval_required": dec["approval_required"],
+                "total_event_count": event_count,
+                "active_actions":    [] if event_count < 100 else dec["active_actions"],
+                "last_action":       (dec["active_actions"][0] if dec["active_actions"] else None) if event_count >= 100 else None,
+                "approval_required": False if event_count < 100 else dec["approval_required"],
                 "metadata": {
                     "ip":       row.get("last_ip"),
                     "mac":      row.get("mac_address"),
@@ -462,7 +488,7 @@ def get_entity_detail(entity_id: str):
                 ORDER BY timestamp DESC LIMIT 50
             """, (entity_id,))
             trust_history = [
-                {"time": r[0].isoformat(), "score": float(r[1] or 80), "adjusted_risk": float(r[2] or 0)}
+                {"time": r[0].isoformat(), "score": float(r[1] if r[1] is not None else 80), "adjusted_risk": float(r[2] if r[2] is not None else 0)}
                 for r in cur.fetchall()
             ][::-1]  # oldest first for charts
 
@@ -473,7 +499,7 @@ def get_entity_detail(entity_id: str):
                 ORDER BY timestamp DESC LIMIT 50
             """, (entity_id,))
             anomaly_history = [
-                {"time": r[0].isoformat(), "score": float(r[1] or 0), "reasons": r[2] or []}
+                {"time": r[0].isoformat(), "score": round(min(1.0, float(r[1] or 0) / 100.0), 4) if float(r[1] or 0) > 1.0 else float(r[1] or 0), "reasons": r[2] or []}
                 for r in cur.fetchall()
             ][::-1]
 
@@ -493,12 +519,29 @@ def get_entity_detail(entity_id: str):
             bl_row = cur.fetchone()
             ml_state = bl_row[0] if bl_row else None
 
+            # Total event count (for warmup detection — not capped at 50)
+            cur.execute("SELECT COUNT(*) FROM trust_scores WHERE device_id = %s", (entity_id,))
+            total_event_count = cur.fetchone()[0] or 0
+
         # Re-calc latest with read-time decay
         trust  = float(row.get("trust_score") or 80)
         adj    = float(row.get("adjusted_risk") or 0)
         state  = row.get("trust_state") or {}
+        if isinstance(state, str):
+            try:
+                state = json.loads(state)
+            except Exception:
+                state = {}
+        
+        # Keep a copy of raw state for category_risks BEFORE applying read-time decay
+        # (decay can zero out values if last_timestamp is missing/zero)
+        raw_state = dict(state)
         
         trust, adj, state = _apply_read_time_decay(state, row.get("device_type") or "unknown")
+
+        # If decay wiped the state but raw values exist, use raw (normalised via tanh)
+        def _safe_cat(cat):
+            return _normalize_risk_score(raw_state.get(cat, 0))
 
         ts_val = row.get("score_ts") or row.get("last_seen")
         dec    = _trust_to_decision(trust)
@@ -506,16 +549,39 @@ def get_entity_detail(entity_id: str):
         te     = _build_trust_evaluation(entity_id, trust, adj, state, ts_val)
         ts_str = ts_val.isoformat() if hasattr(ts_val, "isoformat") else str(ts_val or "")
 
+        # Append virtual 'current' point to history to match Big Number display
+        # This handles the mismatch where Big Number has read-time decay but history doesn't.
+        now_ts_str = datetime.now(timezone.utc).isoformat()
+        trust_history.append({
+            "time": now_ts_str,
+            "score": round(trust, 1),
+            "adjusted_risk": round(adj, 4)
+        })
+        # Keep only last 50
+        if len(trust_history) > 50:
+            trust_history = trust_history[-50:]
+
+        # Enforce 100/0 during warmup (first 50 events)
+        if total_event_count < 100:
+            trust = 100.0
+            adj = 0.0
+            te["final_trust_score"] = 100.0
+            te["confidence"] = 100.0
+            for k in te["trust_evaluation"]:
+                te["trust_evaluation"][k]["Rc"] = 0.0
+
         return {
             "entity_id":    entity_id,
             "trust_score":  round(trust, 1),
+            "trust_history": trust_history,
             "confidence":   round(min(100, max(0, (1 - adj) * 100)), 1),
-            "decision":     dec["decision"],
+            "decision":     "trusted" if total_event_count < 100 else dec["decision"],
             "category_breakdown": cat_bd,
             "last_updated": ts_str,
-            "active_actions":    dec["active_actions"],
-            "last_action":  dec["active_actions"][0] if dec["active_actions"] else None,
-            "approval_required": dec["approval_required"],
+            "total_event_count": total_event_count,
+            "active_actions":    [] if total_event_count < 100 else dec["active_actions"],
+            "last_action":  (dec["active_actions"][0] if dec["active_actions"] else None) if total_event_count >= 100 else None,
+            "approval_required": False if total_event_count < 100 else dec["approval_required"],
             "metadata": {
                 "ip":       row.get("last_ip"),
                 "mac":      row.get("mac_address"),
@@ -525,16 +591,17 @@ def get_entity_detail(entity_id: str):
                 "simulated": "false",
             },
             "trust_evaluation":  te,
+            "category_risks":    {
+                "N": _safe_cat("N") if total_event_count >= 100 else 0.0,
+                "I": _safe_cat("I") if total_event_count >= 100 else 0.0,
+                "C": _safe_cat("C") if total_event_count >= 100 else 0.0,
+                "V": _safe_cat("V") if total_event_count >= 100 else 0.0
+            },
             "trust_history":     trust_history,
             "anomaly_history":   anomaly_history,
             "risk_history":      risk_history,
             "ml_state":          ml_state,
-            "category_risks":    {
-                "N": round(float(state.get("N", 0) or 0), 4),
-                "I": round(float(state.get("I", 0) or 0), 4),
-                "C": round(float(state.get("C", 0) or 0), 4),
-                "V": round(float(state.get("V", 0) or 0), 4),
-            },
+            "total_event_count": total_event_count,
         }
     except Exception as exc:
         import traceback; traceback.print_exc()
@@ -544,7 +611,9 @@ def get_entity_detail(entity_id: str):
 
 
 # ─────────────────────────────────────────────
-# POST /response/approve  (SIMULATED)
+# POST /response/approve  (legacy compat shim)
+# Kept so existing frontend calls don't 404.
+# Routes through the real executor now.
 # ─────────────────────────────────────────────
 
 class ApprovalRequest(BaseModel):
@@ -557,47 +626,35 @@ class ApprovalRequest(BaseModel):
 @router.post("/response/approve")
 def approve_response(payload: ApprovalRequest):
     """
-    Simulated response engine: logs the SOC approval to the alerts table.
-    Does NOT perform real network isolation/account lock (TBD).
+    Legacy endpoint — kept for backward compatibility with the old frontend.
+    Now routes through ResponseExecutor instead of writing directly to alerts.
     """
-    action_id = f"ACT-{payload.entity_id[:8]}-{uuid.uuid4().hex[:6]}"
-    now = datetime.now(timezone.utc)
-
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO alerts (
-                    alert_id, device_id, source, event_type,
-                    severity, risk_score, trust_score,
-                    anomaly_reasons, action, timestamp
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (alert_id) DO NOTHING
-            """, (
-                action_id,
-                payload.entity_id,
-                "soc_analyst",
-                "manual_response",
-                "INFO",
-                0, 0, '[]',
-                f"{'approved' if payload.approved else 'rejected'}:{payload.action}",
-                now,
-            ))
-        conn.commit()
-    except Exception as exc:
-        print(f"[v1/response] Error: {exc}")
-        conn.rollback()
-    finally:
-        put_conn(conn)
-
+    executor = get_executor()
+    if payload.approved:
+        result = executor.execute(
+            action       = payload.action,
+            device_id    = payload.entity_id,
+            triggered_by = payload.approved_by or "SOC_ANALYST",
+            auto_approve = True,
+            metadata     = {"source": "legacy_approve_endpoint"},
+        )
+    else:
+        # Reject: just log it without executing
+        result = executor.execute(
+            action       = "monitor",
+            device_id    = payload.entity_id,
+            triggered_by = payload.approved_by or "SOC_ANALYST",
+            auto_approve = True,
+            metadata     = {"source": "legacy_approve_endpoint", "rejected_action": payload.action},
+        )
     return {
-        "status":    "ok",
-        "action_id": action_id,
-        "entity_id": payload.entity_id,
-        "action":    payload.action,
-        "approved":  payload.approved,
-        "simulated": True,
-        "timestamp": now.isoformat(),
+        "status":      "ok",
+        "execution_id": result.get("execution_id"),
+        "entity_id":   payload.entity_id,
+        "action":      payload.action,
+        "approved":    payload.approved,
+        "simulated":   False,
+        "timestamp":   result.get("created_at"),
     }
 
 
@@ -691,6 +748,234 @@ def list_simulation_runs():
 @router.get("/response/actions")
 def list_response_actions():
     """Returns recent automated response actions."""
+    return get_response_actions()
+
+
+# ─────────────────────────────────────────────
+# GET /devices  — For the frontend dropdown
+# ─────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════
+# RESPONSE EXECUTOR — Admin API
+# New system replacing the old simulated response_engine.py
+# ═══════════════════════════════════════════════════════════════════
+
+
+# ─────────────────────────────────────────────
+# GET /response/executions
+# ─────────────────────────────────────────────
+
+@router.get("/response/executions")
+def get_response_executions(
+    device_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 200,
+):
+    """
+    List response execution records from the response_executor system.
+    Optional filters: device_id, status (pending/running/success/failed/rejected).
+    """
+    return list_response_executions(device_id=device_id, status=status, limit=limit)
+
+
+# ─────────────────────────────────────────────
+# GET /response/executions/pending
+# ─────────────────────────────────────────────
+
+@router.get("/response/executions/pending")
+def get_pending_executions():
+    """Returns all executions awaiting admin approval."""
+    return list_response_executions(status="pending", limit=100)
+
+
+# ─────────────────────────────────────────────
+# GET /response/executions/{execution_id}
+# ─────────────────────────────────────────────
+
+@router.get("/response/executions/{execution_id}")
+def get_execution_detail(execution_id: str):
+    """Get a single execution record by ID."""
+    rec = get_execution(execution_id)
+    if not rec:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Execution not found")
+    return rec
+
+
+# ─────────────────────────────────────────────
+# GET /response/blocks
+# ─────────────────────────────────────────────
+
+@router.get("/response/blocks")
+def get_device_blocks(active_only: bool = True):
+    """List blocked devices. Pass active_only=false to include historical blocks."""
+    return list_device_blocks(active_only=active_only)
+
+
+# ─────────────────────────────────────────────
+# POST /response/block  — Manual admin block
+# ─────────────────────────────────────────────
+
+class BlockRequest(BaseModel):
+    device_id:  str
+    reason:     str = "Manual SOC block"
+    blocked_by: str = "SOC_ADMIN"
+    metadata:   Optional[dict] = None
+
+
+@router.post("/response/block")
+def block_device(payload: BlockRequest):
+    """
+    Immediately block a device — no approval required for admin-initiated blocks.
+    Creates an execution record with action=block_device and registers in device_blocks.
+    """
+    try:
+        executor = get_executor()
+        result = executor.block_device(
+            device_id    = payload.device_id,
+            reason       = payload.reason,
+            triggered_by = payload.blocked_by,
+            metadata     = payload.metadata,
+        )
+        return {"status": "ok", "execution": result}
+    except Exception as exc:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ─────────────────────────────────────────────
+# POST /response/unblock  — Manual admin unblock
+# ─────────────────────────────────────────────
+
+class UnblockRequest(BaseModel):
+    device_id:    str
+    unblocked_by: str = "SOC_ADMIN"
+
+
+@router.post("/response/unblock")
+def unblock_device(payload: UnblockRequest):
+    """
+    Immediately unblock a device — clears the device_blocks entry.
+    Creates an execution record with action=unblock_device.
+    """
+    try:
+        executor = get_executor()
+        result = executor.unblock_device(
+            device_id    = payload.device_id,
+            unblocked_by = payload.unblocked_by,
+        )
+        return {"status": "ok", "execution": result}
+    except Exception as exc:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ─────────────────────────────────────────────
+# POST /response/execute  — Manual action trigger
+# ─────────────────────────────────────────────
+
+class ManualExecuteRequest(BaseModel):
+    device_id:    str
+    action:       str
+    triggered_by: str = "SOC_ADMIN"
+    trust_score:  float = 50.0
+    risk_score:   float = 0.0
+    severity:     str = "MEDIUM"
+    auto_approve: bool = False
+    metadata:     Optional[dict] = None
+
+
+@router.post("/response/execute")
+def manual_execute(payload: ManualExecuteRequest):
+    """
+    Manually trigger any response action against a device.
+    Hard containment actions (isolate_vlan, lock_account, etc.) will require
+    admin approval unless auto_approve=true is explicitly set.
+    """
+    if payload.action not in ALL_ACTIONS:
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown action '{payload.action}'. Valid: {ALL_ACTIONS}"
+        )
+    try:
+        executor = get_executor()
+        result = executor.execute(
+            action       = payload.action,
+            device_id    = payload.device_id,
+            trust_score  = payload.trust_score,
+            risk_score   = payload.risk_score,
+            severity     = payload.severity,
+            triggered_by = payload.triggered_by,
+            metadata     = payload.metadata or {},
+            auto_approve = payload.auto_approve,
+        )
+        return {"status": "ok", "execution": result}
+    except Exception as exc:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ─────────────────────────────────────────────
+# POST /response/executions/{id}/approve
+# ─────────────────────────────────────────────
+
+class ExecutionApprovalRequest(BaseModel):
+    approver: str = "SOC_ADMIN"
+
+
+@router.post("/response/executions/{execution_id}/approve")
+def approve_execution(execution_id: str, payload: ExecutionApprovalRequest):
+    """
+    Approve a pending execution. The action is dispatched immediately after approval.
+    Only applies to executions with status=pending.
+    """
+    try:
+        executor = get_executor()
+        result = executor.approve(execution_id, payload.approver)
+        return {"status": "ok", "execution": result}
+    except ValueError as exc:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ─────────────────────────────────────────────
+# POST /response/executions/{id}/reject
+# ─────────────────────────────────────────────
+
+class ExecutionRejectRequest(BaseModel):
+    rejector: str = "SOC_ADMIN"
+    reason:   str = ""
+
+
+@router.post("/response/executions/{execution_id}/reject")
+def reject_execution(execution_id: str, payload: ExecutionRejectRequest):
+    """
+    Reject a pending execution. No action is taken against the device.
+    Only applies to executions with status=pending.
+    """
+    try:
+        executor = get_executor()
+        result = executor.reject(execution_id, payload.rejector, payload.reason)
+        return {"status": "ok", "execution": result}
+    except ValueError as exc:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ─────────────────────────────────────────────
+# GET /response/actions  (legacy compatibility)
+# ─────────────────────────────────────────────
+
+@router.get("/response/actions")
+def list_response_actions_legacy():
+    """Legacy endpoint — kept for backward compat. Prefer /response/executions."""
     return get_response_actions()
 
 

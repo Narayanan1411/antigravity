@@ -19,6 +19,7 @@ Hybrid design:
 from __future__ import annotations
 import sys
 import json
+import math
 import uuid
 from pathlib import Path
 
@@ -31,7 +32,7 @@ from pipeline.topics  import FEATURE_STREAM, ML_SCORES
 from db.db import insert_ml_score, load_baseline, save_baseline, init_schema
 
 # ─── Tuning constants ──────────────────────────────────────
-WARMUP_SAMPLES = 20          # observations before z-score kicks in
+WARMUP_SAMPLES = 100          # observations before z-score kicks in
 Z_CAP          = 10.0        # cap individual z-scores to avoid single outlier domination
 DECAY_ALPHA    = 0.01        # EMA decay for very long-running devices (optional future use)
 
@@ -47,6 +48,10 @@ TRACKED_METRICS = [
     "memory_percent",
     "dns_query_length",
     "archetype_deviation",   # Behavioral archetype distance (NEW)
+    "cpu_avg",
+    "cpu_spike",
+    "disk_io_rate",
+    "process_count"
 ]
 
 ARCHETYPE_WEIGHT     = 0.4   # Blend weight for archetype deviation
@@ -121,10 +126,10 @@ def rule_score(features: dict, collector: str) -> tuple[float, list[str]]:
     if features.get("cpu_percent", 0) > 90:
         score += 7.0; reasons.append("cpu_spike")
     bytes_total = features.get("bytes_total", 0)
-    if bytes_total > 50_000_000:
-        score += 8.0; reasons.append("large_data_transfer")
-    elif bytes_total > 10_000_000:
-        score += 4.0; reasons.append("above_avg_transfer")
+    if bytes_total > 500_000_000:
+        score += 8.0; reasons.append("critical_data_exfiltration_threshold")
+    elif bytes_total > 100_000_000:
+        score += 4.0; reasons.append("large_data_transfer")
 
     return round(score, 4), reasons
 
@@ -218,6 +223,16 @@ class MLMonitor(BaseConsumer):
         features  = event.get("features", {})
 
         anomaly_score, breakdown, reasons = process_features(device_id, features, collector)
+
+        # --- LSTM Integration ---
+        lstm_score = float(event.get("ml_anomaly_score") or 0.0)
+        if lstm_score and lstm_score > 0:
+            # Normalize raw MSE reconstruction error via tanh so it stays in [0,1]
+            # MSE of ~1.0 → tanh(1.0)=0.76, MSE of ~5.0 → tanh(5.0)≈1.0
+            lstm_norm = round(min(1.0, math.tanh(lstm_score / 10.0)), 4)
+            anomaly_score = max(anomaly_score, lstm_norm)
+            if event.get("ml_is_anomaly"):
+                reasons.append("deep_learning_anomaly")
 
         # --- Archetype blending ---
         # Blend archetype_deviation (computed in FeatureEngine) into anomaly score.

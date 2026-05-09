@@ -61,7 +61,7 @@ function RiskGauge({ label, value, icon: Icon, color }: { label: string; value: 
         <div className="flex flex-col gap-1">
             <div className="flex items-center justify-between text-[10px]">
                 <span className="flex items-center gap-1 text-gray-400"><Icon className="w-3 h-3" />{label}</span>
-                <span className="font-mono font-bold" style={{ color }}>{pct.toFixed(1)}%</span>
+                <span className="font-mono font-bold tabular-nums text-right w-[45px]" style={{ color }}>{pct.toFixed(1)}%</span>
             </div>
             <div className="h-2 bg-white/5 rounded-full overflow-hidden">
                 <div className="h-full rounded-full transition-all duration-500" style={{ width: `${pct}%`, backgroundColor: color }} />
@@ -86,7 +86,12 @@ export default function AdaptiveTrustPage() {
     );
 
     const isOnline = status === 'online';
-    const trust = detail?.trust_score ?? 80;
+    const isWarmup = activeId && (detail?.total_event_count ?? 0) < 100;
+    
+    const trust = isWarmup ? 100 : (detail?.trust_score ?? 100);
+    const confidence = isWarmup ? 100 : (detail?.confidence ?? 100);
+    const decision = isWarmup ? 'warming up' : (detail?.decision ?? 'trusted');
+    const catRisks = isWarmup ? { N: 0, I: 0, C: 0, V: 0 } : (detail?.category_risks ?? { N: 0, I: 0, C: 0, V: 0 });
 
     return (
         <div className="flex flex-col h-full -m-6 overflow-hidden">
@@ -327,22 +332,22 @@ export default function AdaptiveTrustPage() {
                         <div className="w-full bg-white/5 h-2 rounded-full mt-3 overflow-hidden">
                             <div className="h-full rounded-full transition-all duration-500" style={{ width: `${trust}%`, backgroundColor: trustColor(trust) }} />
                         </div>
-                        <p className="text-[10px] text-gray-500 mt-2 uppercase font-semibold">{detail?.decision ?? '...'}</p>
+                        <p className="text-[10px] text-gray-500 mt-2 uppercase font-semibold">{decision}</p>
                     </div>
 
                     {/* Confidence */}
                     <div className="p-3 rounded-xl bg-background/50 border border-border/50 text-center">
                         <p className="text-[10px] text-gray-500 uppercase mb-1">Inference Confidence</p>
-                        <p className="text-2xl font-bold text-white">{detail?.confidence ?? 100}%</p>
+                        <p className="text-2xl font-bold text-white">{confidence}%</p>
                     </div>
 
                     {/* Category Risk gauges — I/C/V/N */}
                     <div className="p-3 rounded-xl bg-background/50 border border-border/50 space-y-3">
-                        <p className="text-[10px] text-gray-500 uppercase font-semibold">Category Risk (I/C/V/N)</p>
-                        <RiskGauge label="Network (N)" value={detail?.category_risks?.N ?? 0} icon={Network} color={riskColor(detail?.category_risks?.N ?? 0)} />
-                        <RiskGauge label="Identity (I)" value={detail?.category_risks?.I ?? 0} icon={User} color={riskColor(detail?.category_risks?.I ?? 0)} />
-                        <RiskGauge label="Cloud (C)" value={detail?.category_risks?.C ?? 0} icon={Cloud} color={riskColor(detail?.category_risks?.C ?? 0)} />
-                        <RiskGauge label="Hardware (V)" value={detail?.category_risks?.V ?? 0} icon={HardDrive} color={riskColor(detail?.category_risks?.V ?? 0)} />
+                        <p className="text-[10px] text-gray-500 uppercase font-semibold text-left">Category Risk (I/C/V/N)</p>
+                        <RiskGauge label="Identity (I)" value={catRisks.I} icon={User} color={riskColor(catRisks.I)} />
+                        <RiskGauge label="Cloud (C)" value={catRisks.C} icon={Cloud} color={riskColor(catRisks.C)} />
+                        <RiskGauge label="Hardware (V)" value={catRisks.V} icon={HardDrive} color={riskColor(catRisks.V)} />
+                        <RiskGauge label="Network (N)" value={catRisks.N} icon={Network} color={riskColor(catRisks.N)} />
                     </div>
 
                     {/* Device metadata */}
@@ -358,16 +363,16 @@ export default function AdaptiveTrustPage() {
                     )}
 
                     {/* ML warmup notice */}
-                    {(detail?.trust_history?.length ?? 0) < 10 && (
+                    {(detail?.total_event_count ?? 0) < 100 && (
                         <div className="p-3 rounded-xl border border-dashed border-yellow-500/20 bg-yellow-500/5">
                             <p className="text-[10px] text-yellow-400/80 font-semibold mb-1">⏳ ML Warmup</p>
                             <p className="text-[9px] text-gray-500 leading-relaxed">
-                                Device needs ~10 events before ML baselines are established. Trust defaults to 80 during warmup.
+                                Device needs ~100 events before ML baselines are established. Trust defaults to 100 during warmup.
                             </p>
                             <div className="mt-2 h-1 bg-white/5 rounded-full overflow-hidden">
-                                <div className="h-full bg-yellow-500/60 rounded-full transition-all" style={{ width: `${Math.min(100, ((detail?.trust_history?.length ?? 0) / 10) * 100)}%` }} />
+                                <div className="h-full bg-yellow-500/60 rounded-full transition-all" style={{ width: `${Math.min(100, ((detail?.total_event_count ?? 0) / 100) * 100)}%` }} />
                             </div>
-                            <p className="text-[9px] text-gray-600 mt-1">{detail?.trust_history?.length ?? 0}/10 events</p>
+                            <p className="text-[9px] text-gray-600 mt-1">{detail?.total_event_count ?? 0}/100 events</p>
                         </div>
                     )}
                 </div>

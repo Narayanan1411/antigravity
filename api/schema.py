@@ -16,7 +16,7 @@ CANONICAL_FIELDS = [
     "user_id", "login_success", "auth_type", "mfa_status",
     "mac_address", "hostname", "os", "device_type",
     "api_call", "resource", "region", "hardware_fingerprint",
-    "interface", "raw"
+    "interface", "raw", "ml_anomaly_score", "ml_is_anomaly", "source"
 ]
 
 
@@ -59,9 +59,13 @@ def events_from_network(payload: dict) -> list[dict]:
             "bytes_sent": flow.get("bytes_sent", 0),
             "bytes_received": flow.get("bytes_received", 0),
             "mac_address": flow.get("mac_address"),
+            "device_id": flow.get("device_id") or (f"dev_{str(flow.get('mac_address')).replace(':', '')}" if flow.get("mac_address") else None),
+            "device_type": flow.get("device_type"),
             "hostname": flow.get("hostname"),
             "interface": flow.get("interface"),
-            "raw": flow
+            "raw": flow,
+            "ml_anomaly_score": payload.get("ml_anomaly_score"),
+            "ml_is_anomaly": payload.get("ml_is_anomaly")
         }))
     return events
 

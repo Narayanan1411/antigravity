@@ -76,8 +76,10 @@ open_tab "Simulation Controller" "python3 services/simulation_controller.py"
 sleep 0.5
 open_tab "Network Discovery"    "python3 services/network_discovery_service.py"
 sleep 0.5
+open_tab "Hardware Monitoring"  "python3 services/hardware_monitoring_service.py"
+sleep 0.5
 
-echo "[3/7] ✅ 10 pipeline services launched in Terminal tabs"
+echo "[3/7] ✅ 11 pipeline services launched in Terminal tabs"
 echo ""
 
 # ── Network Sniffer (requires sudo) ──────────────────────
