@@ -20,7 +20,6 @@ import {
   Clock,
   Info,
   Brain,
-  FlaskConical
 } from 'lucide-react';
 import { useState, useMemo } from 'react';
 import {
@@ -155,7 +154,7 @@ export default function EntityDetailPage() {
         </div>
         <div className="text-right">
           <div className="text-sm text-gray-400 mb-1 flex items-center justify-end gap-2">
-            {entity.trust_evaluation && (
+            {entity.trust_evaluation && entity.trust_score != null && (
               <span className="flex items-center gap-1 text-[10px]">
                 PREV: {entity.trust_evaluation.previous_trust_score}
                 {entity.trust_score !== entity.trust_evaluation.previous_trust_score && (
@@ -496,9 +495,6 @@ export default function EntityDetailPage() {
               {entity.metadata?.os && (
                 <div className="flex justify-between"><span className="text-gray-500">OS</span><span className="text-white">{entity.metadata.os}</span></div>
               )}
-              {entity.metadata?.type && (
-                <div className="flex justify-between"><span className="text-gray-500">Type</span><span className="text-white uppercase text-xs">{entity.metadata.type}</span></div>
-              )}
             </div>
           </div>
 
@@ -567,19 +563,21 @@ function CategoryScore({ label, value, delta, signals, icon: Icon }: any) {
   );
 }
 
-function getScoreTextColor(score: number) {
-  if (score >= 80) return 'text-success';
-  if (score >= 50) return 'text-warning';
-  if (score >= 30) return 'text-alert';
+function getScoreTextColor(score: number | null | undefined) {
+  const s = score ?? 0;
+  if (s >= 80) return 'text-success';
+  if (s >= 50) return 'text-warning';
+  if (s >= 30) return 'text-alert';
   return 'text-critical';
 }
 
-function DecisionBadge({ decision, score }: { decision: string, score: number }) {
+function DecisionBadge({ decision, score }: { decision: string, score: number | null }) {
+  const s = score ?? 0;
   let colors = "bg-gray-500/10 text-gray-500 border-gray-500/20";
 
-  if (score >= 80) colors = "bg-success/10 text-success border-success/20";
-  else if (score >= 50) colors = "bg-warning/10 text-warning border-warning/20";
-  else if (score >= 30) colors = "bg-alert/10 text-alert border-alert/20";
+  if (s >= 80) colors = "bg-success/10 text-success border-success/20";
+  else if (s >= 50) colors = "bg-warning/10 text-warning border-warning/20";
+  else if (s >= 30) colors = "bg-alert/10 text-alert border-alert/20";
   else colors = "bg-critical/10 text-critical border-critical/20";
 
   return (

@@ -2,22 +2,18 @@
 
 import { usePolling } from '@/hooks/usePolling';
 import { AuditLog } from '@/types';
-import { Filter, Search, Download, FlaskConical } from 'lucide-react';
+import { Filter, Search, Download } from 'lucide-react';
 import { useState } from 'react';
 
 export default function AuditPage() {
   const { data: logs, isLoading } = usePolling<AuditLog[]>('/audit/');
   const [searchTerm, setSearchTerm] = useState('');
   const [typeFilter, setTypeFilter] = useState('all');
-  const [simulatedFilter, setSimulatedFilter] = useState<'all' | 'simulated' | 'real'>('all');
 
   const filteredLogs = logs?.filter(log => {
     const matchesSearch = log.entity_id.toLowerCase().includes(searchTerm.toLowerCase());
     const matchesType = typeFilter === 'all' || log.action_type === typeFilter;
-    const matchesSimulated = simulatedFilter === 'all' ||
-      (simulatedFilter === 'simulated' && log.simulated) ||
-      (simulatedFilter === 'real' && !log.simulated);
-    return matchesSearch && matchesType && matchesSimulated;
+    return matchesSearch && matchesType;
   }).sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
 
   const actionTypes = Array.from(new Set(logs?.map(l => l.action_type) || []));
@@ -28,7 +24,7 @@ export default function AuditPage() {
       return;
     }
 
-    const headers = ['Timestamp', 'Entity ID', 'Action Type', 'Status', 'Mode', 'Reason', 'Approved By'];
+    const headers = ['Timestamp', 'Entity ID', 'Action Type', 'Status', 'Reason', 'Approved By'];
     const csvContent = [
       headers.join(','),
       ...filteredLogs.map(log => [
@@ -36,7 +32,6 @@ export default function AuditPage() {
         log.entity_id,
         log.action_type,
         log.status,
-        log.simulated ? 'SIMULATED' : 'REAL',
         `"${log.reason?.replace(/"/g, '""') || ''}"`, // Escape quotes in CSV
         log.approved_by || 'SYSTEM'
       ].join(','))
@@ -105,21 +100,6 @@ export default function AuditPage() {
             </select>
           </div>
         </div>
-        <div className="w-40 space-y-1.5">
-          <label className="text-xs text-gray-500 font-medium">Mode</label>
-          <div className="relative">
-            <FlaskConical className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
-            <select
-              className="bg-card border border-border rounded-md pl-10 pr-4 py-2 text-sm focus:outline-none focus:border-primary w-full appearance-none"
-              value={simulatedFilter}
-              onChange={(e) => setSimulatedFilter(e.target.value as 'all' | 'simulated' | 'real')}
-            >
-              <option value="all">All Modes</option>
-              <option value="simulated">Simulated</option>
-              <option value="real">Real</option>
-            </select>
-          </div>
-        </div>
       </div>
 
       <div className="soc-card p-0 overflow-hidden">
@@ -130,7 +110,6 @@ export default function AuditPage() {
               <th>Entity ID</th>
               <th>Action Type</th>
               <th>Status</th>
-              <th>Mode</th>
               <th>Reason / Trigger</th>
               <th>Approved By</th>
             </tr>
@@ -153,15 +132,6 @@ export default function AuditPage() {
                     {log.status.toUpperCase()}
                   </span>
                 </td>
-                <td>
-                  <span className={`text-[10px] px-1.5 py-0.5 rounded border flex items-center gap-1 w-fit ${log.simulated
-                    ? 'bg-primary/10 text-primary border-primary/20'
-                    : 'bg-success/10 text-success border-success/20'
-                    }`}>
-                    {log.simulated && <FlaskConical className="w-3 h-3" />}
-                    {log.simulated ? 'SIMULATED' : 'REAL'}
-                  </span>
-                </td>
                 <td className="text-sm text-gray-400 max-w-xs truncate" title={log.reason}>
                   {log.reason}
                 </td>
@@ -181,7 +151,7 @@ export default function AuditPage() {
             ))}
             {filteredLogs?.length === 0 && (
               <tr>
-                <td colSpan={7} className="text-center py-12 text-gray-500 italic">
+                <td colSpan={6} className="text-center py-12 text-gray-500 italic">
                   No logs matching criteria
                 </td>
               </tr>

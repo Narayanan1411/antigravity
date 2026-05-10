@@ -217,10 +217,11 @@ def get_entities():
                     d.os,
                     d.device_type,
                     d.last_seen,
-                    COALESCE(ts.trust_score, 80)       AS trust_score,
-                    COALESCE(ts.adjusted_risk, 0.0)    AS adjusted_risk,
+                    COALESCE(ts.trust_score, 80)        AS trust_score,
+                    COALESCE(ts.adjusted_risk, 0.0)     AS adjusted_risk,
                     COALESCE(ts.timestamp, d.last_seen) AS score_ts,
-                    tst.state                           AS trust_state,
+                    tst.state                            AS trust_state,
+                    ec.cnt                               AS trust_score_count,
                     (
                         SELECT ip FROM events
                         WHERE device_id = d.device_id
@@ -234,12 +235,12 @@ def get_entities():
                     ORDER BY timestamp DESC
                     LIMIT 1
                 ) ts ON true
-                    LEFT JOIN trust_states tst ON tst.device_id = d.device_id
-                    LEFT JOIN LATERAL (
-                        SELECT COUNT(*) as cnt FROM trust_scores WHERE device_id = d.device_id
-                    ) ec ON true
-                    ORDER BY d.last_seen DESC NULLS LAST
-                    LIMIT 500
+                LEFT JOIN trust_states tst ON tst.device_id = d.device_id
+                LEFT JOIN LATERAL (
+                    SELECT COUNT(*) AS cnt FROM trust_scores WHERE device_id = d.device_id
+                ) ec ON true
+                ORDER BY d.last_seen DESC NULLS LAST
+                LIMIT 500
             """)
             rows = [dict(zip([d[0] for d in cur.description], r))
                     for r in cur.fetchall()]
@@ -268,35 +269,34 @@ def get_entities():
             )
 
             ts_str = ts_val.isoformat() if hasattr(ts_val, "isoformat") else str(ts_val or "")
+            last_seen_val = row.get("last_seen")
+            last_seen_str = last_seen_val.isoformat() if hasattr(last_seen_val, "isoformat") else str(last_seen_val or "")
 
-            event_count = row.get("cnt") or 0
-            if event_count < 100:
-                trust = 100.0
-                confidence = 100.0
-                cat_bd = {k: 0.0 for k in cat_bd}
-                # Re-build te with 100/0 for warmup
-                te = _build_trust_evaluation(device_id, 100.0, 0.0, {k:0.0 for k in state}, ts_val)
+            event_count = int(row.get("trust_score_count") or 0)
+            discovering = event_count == 0
 
             entities.append({
-                "entity_id":         row["device_id"],
-                "trust_score":       round(trust, 1),
-                "confidence":        confidence,
-                "decision":          "trusted" if event_count < 100 else dec["decision"],
+                "entity_id":          row["device_id"],
+                "trust_score":        None if discovering else round(trust, 1),
+                "confidence":         0 if discovering else confidence,
+                "decision":           "discovering" if discovering else dec["decision"],
                 "category_breakdown": cat_bd,
-                "last_updated":      ts_str,
-                "total_event_count": event_count,
-                "active_actions":    [] if event_count < 100 else dec["active_actions"],
-                "last_action":       (dec["active_actions"][0] if dec["active_actions"] else None) if event_count >= 100 else None,
-                "approval_required": False if event_count < 100 else dec["approval_required"],
+                "last_updated":       ts_str,
+                "last_seen":          last_seen_str,
+                "total_event_count":  event_count,
+                "active_actions":     [] if discovering else dec["active_actions"],
+                "last_action":        None if discovering else (dec["active_actions"][0] if dec["active_actions"] else None),
+                "approval_required":  False,
+                "discovering":        discovering,
                 "metadata": {
-                    "ip":       row.get("last_ip"),
-                    "mac":      row.get("mac_address"),
-                    "hostname": row.get("hostname"),
-                    "os":       row.get("os"),
-                    "type":     row.get("device_type") or "workstation",
+                    "ip":        row.get("last_ip"),
+                    "mac":       row.get("mac_address"),
+                    "hostname":  row.get("hostname"),
+                    "os":        row.get("os"),
+                    "type":      row.get("device_type") or "workstation",
                     "simulated": "false",
                 },
-                "trust_evaluation": te,
+                "trust_evaluation": None if discovering else te,
                 "trust_history":    [],
             })
 
@@ -985,15 +985,24 @@ def list_response_actions_legacy():
 
 @router.get("/devices")
 def get_device_list():
-    """Returns a simplified list of devices for dropdown pickers."""
+    """
+    Returns devices that have been through the full pipeline (have trust scores).
+    Excludes phantom/discovery-only devices that never produced trust data,
+    keeping the list consistent with what the entities page shows.
+    """
     conn = get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT device_id, hostname, device_type, last_seen
-                FROM devices
-                ORDER BY last_seen DESC
-                LIMIT 200
+                SELECT d.device_id, d.hostname, d.device_type, d.last_seen
+                FROM devices d
+                WHERE EXISTS (
+                    SELECT 1 FROM trust_scores ts
+                    WHERE ts.device_id = d.device_id
+                    LIMIT 1
+                )
+                ORDER BY d.last_seen DESC
+                LIMIT 50
             """)
             rows = cur.fetchall()
             return [
@@ -1010,3 +1019,185 @@ def get_device_list():
         return []
     finally:
         put_conn(conn)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /simulation/run  —  Isolated in-memory simulation
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Design principles:
+#  • NEVER writes to trust_states, device_baselines, or FEATURE_STREAM
+#    → zero ML baseline contamination
+#  • Computes trust trajectory purely in-memory using the same math as trust_engine
+#  • Triggers real response_executor so actions appear in the Responses tab
+#    as pending approvals, tagged triggered_by="sim:<run_id>:<attack>" for filtering
+#  • The simulation tab displays local animation state; other tabs are unaffected
+# ─────────────────────────────────────────────────────────────────────────────
+
+import math as _sim_math
+
+# Per-attack risk increment profile (I/C/V/N per round).
+# Tuned so that after 6 rounds trust drops below containment threshold (~20).
+_ATTACK_PROFILES: dict = {
+    "c2_beaconing": {
+        "name":               "C2 Beaconing",
+        "description":        "DNS tunneling + periodic HTTPS beacons to C2 server",
+        "severity":           "HIGH",
+        "increments":         {"N": 0.60},          # Network risk
+        "containment_action": "firewall_block",
+    },
+    "credential_abuse": {
+        "name":               "Credential Abuse",
+        "description":        "Repeated login failures + privilege escalation attempt",
+        "severity":           "HIGH",
+        "increments":         {"I": 0.30},          # Identity risk
+        "containment_action": "lock_account",
+    },
+    "lateral_movement": {
+        "name":               "Lateral Movement",
+        "description":        "SSH pivoting across internal network segments",
+        "severity":           "CRITICAL",
+        "increments":         {"N": 0.25, "C": 0.15},  # Network + Correlation
+        "containment_action": "isolate_vlan",
+    },
+    "ransomware_activity": {
+        "name":               "Ransomware Activity",
+        "description":        "High CPU, mass file encryption, shadow copy deletion",
+        "severity":           "CRITICAL",
+        "increments":         {"V": 0.20, "I": 0.15},  # Visibility + Identity
+        "containment_action": "kill_process",
+    },
+}
+
+_SIM_ROUNDS = 6
+
+
+def _sim_trust(state: dict) -> float:
+    """Same formula as trust_engine / _apply_read_time_decay."""
+    I = float(state.get("I", 0))
+    C = float(state.get("C", 0))
+    V = float(state.get("V", 0))
+    N = float(state.get("N", 0))
+    AR = WEIGHTS["I"] * I + WEIGHTS["C"] * C + WEIGHTS["V"] * V + WEIGHTS["N"] * N
+    active  = I + C + V + N
+    max_val = max(I, C, V, N) if (I or C or V or N) else 0.0
+    CAF = 1.0 + ALPHA_CAF * (active - max_val)
+    adj = AR * CAF
+    return round(100.0 * _sim_math.exp(-K_DECAY * adj), 2)
+
+
+class SimulationRunRequest(BaseModel):
+    device_id:   str
+    attack_type: str
+
+
+@router.post("/simulation/run")
+def simulation_run(req: SimulationRunRequest):
+    """
+    Pure in-memory simulation.
+
+    Returns the full trust-score trajectory so the frontend can animate it
+    locally.  Also fires real response_executor actions (pending, require SOC
+    approval) tagged with the simulation run-id so the Responses tab shows them.
+    No pipeline events are emitted — ML baselines are never touched.
+    """
+    from fastapi import HTTPException as _HTTPException
+
+    if req.attack_type not in _ATTACK_PROFILES:
+        raise _HTTPException(status_code=400, detail=f"Unknown attack type: {req.attack_type}")
+
+    profile = _ATTACK_PROFILES[req.attack_type]
+
+    # Verify device exists (read-only)
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT hostname, device_type FROM devices WHERE device_id = %s",
+                (req.device_id,)
+            )
+            row = cur.fetchone()
+    finally:
+        put_conn(conn)
+
+    if not row:
+        raise _HTTPException(status_code=404, detail=f"Device not found: {req.device_id}")
+
+    hostname, dev_type = row
+
+    # ── Compute trajectory ────────────────────────────────────────────────────
+    # Start from a clean zero-risk state so the demo is reproducible.
+    state = {"I": 0.0, "C": 0.0, "V": 0.0, "N": 0.0}
+    now_ms = int(time.time() * 1000)
+    trajectory = []
+
+    for i in range(_SIM_ROUNDS + 1):          # round 0 = baseline at trust=100
+        trust = _sim_trust(state) if i > 0 else 100.0
+        dec   = _trust_to_decision(trust)
+        active_cats = [
+            cat for cat, key in [("network","N"),("identity","I"),("cloud","C"),("hardware","V")]
+            if state.get(key, 0) > 0.05
+        ]
+        trajectory.append({
+            "round":          i,
+            "time":           now_ms + i * 3000,   # 3 s per round
+            "score":          trust,
+            "decision":       dec["decision"],
+            "active_signals": active_cats,
+        })
+        # Apply increment for the next round
+        if i < _SIM_ROUNDS:
+            for cat, delta in profile["increments"].items():
+                state[cat] = state.get(cat, 0.0) + delta
+
+    # ── Trigger response_executor at threshold breaches ────────────────────────
+    # Actions are created as pending records (require SOC approval) so the
+    # Responses tab shows them authentically.  No handlers are dispatched.
+    run_id   = f"SIM-{uuid.uuid4().hex[:8]}"
+    executor = get_executor()
+    triggered: list[dict] = []
+    fired: set[str] = set()
+
+    def _fire(action: str, trust_at: float):
+        if action in fired:
+            return
+        fired.add(action)
+        try:
+            rec = executor.execute(
+                action       = action,
+                device_id    = req.device_id,
+                trust_score  = round(trust_at, 1),
+                risk_score   = round(max(0.0, 1.0 - trust_at / 100.0), 3),
+                severity     = profile["severity"],
+                triggered_by = f"sim:{run_id}:{req.attack_type}",
+                metadata     = {"simulated": True, "attack_type": req.attack_type, "run_id": run_id},
+                auto_approve = False,   # → pending, requires SOC approval
+            )
+            triggered.append({
+                "action":       action,
+                "at_trust":     round(trust_at, 1),
+                "execution_id": rec.get("execution_id"),
+                "status":       rec.get("status"),
+            })
+        except Exception as exc:
+            print(f"[SimRun] executor.execute({action}) failed: {exc}")
+
+    for pt in trajectory:
+        t = pt["score"]
+        if t < 70:
+            _fire("require_mfa",              t)
+        if t < 40:
+            _fire("restrict_network",         t)
+        if t < 20:
+            _fire(profile["containment_action"], t)
+
+    return {
+        "run_id":                run_id,
+        "device_id":             req.device_id,
+        "hostname":              hostname or req.device_id,
+        "attack_type":           req.attack_type,
+        "profile":               {"name": profile["name"], "description": profile["description"], "severity": profile["severity"]},
+        "trajectory":            trajectory,
+        "triggered_executions":  triggered,
+        "interval_ms":           3000,
+    }

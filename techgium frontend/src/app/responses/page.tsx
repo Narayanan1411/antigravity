@@ -120,7 +120,10 @@ function StatCard({
 
 // ── Block Device Modal ────────────────────────────────────────────────────────
 
-interface Device { device_id: string; hostname: string; device_type: string }
+interface Device { device_id: string; hostname: string; device_type: string; last_seen?: string }
+
+const ONLINE_MS = 5 * 60 * 1000;
+const deviceOnline = (lastSeen?: string) => !!lastSeen && Date.now() - new Date(lastSeen).getTime() < ONLINE_MS;
 
 function BlockModal({
   devices, onClose, onSuccess,
@@ -159,11 +162,14 @@ function BlockModal({
               onChange={e => setDeviceId(e.target.value)}
             >
               <option value="">— select device —</option>
-              {devices.map(d => (
-                <option key={d.device_id} value={d.device_id}>
-                  {d.hostname} ({d.device_type}) · {d.device_id.slice(0, 16)}
-                </option>
-              ))}
+              {devices.map(d => {
+                const online = deviceOnline(d.last_seen);
+                return (
+                  <option key={d.device_id} value={d.device_id}>
+                    {online ? '● ' : '○ '}{d.hostname} · {d.device_id.slice(0, 16)}{online ? '' : ' (offline)'}
+                  </option>
+                );
+              })}
             </select>
           </div>
           <div>
@@ -235,11 +241,14 @@ function ExecuteModal({
               value={form.device_id} onChange={e => set('device_id', e.target.value)}
             >
               <option value="">— select device —</option>
-              {devices.map(d => (
-                <option key={d.device_id} value={d.device_id}>
-                  {d.hostname} ({d.device_type})
-                </option>
-              ))}
+              {devices.map(d => {
+                const online = deviceOnline(d.last_seen);
+                return (
+                  <option key={d.device_id} value={d.device_id}>
+                    {online ? '● ' : '○ '}{d.hostname}{online ? '' : ' (offline)'}
+                  </option>
+                );
+              })}
             </select>
           </div>
           <div>
@@ -423,26 +432,40 @@ export default function ResponsesPage() {
 
   const refresh = useCallback(() => { refreshExec(); refreshBlocks(); }, [refreshExec, refreshBlocks]);
 
-  const pending = useMemo(() => (executions ?? []).filter(e => e.status === 'pending'), [executions]);
+  // Deduplicate pending entries: one entry per (device_id, action).
+  // The API returns rows DESC by created_at, so the first hit per key is the latest.
+  const pending = useMemo(() => {
+    const seen = new Map<string, ResponseExecution>();
+    for (const e of (executions ?? []).filter(e => e.status === 'pending')) {
+      const key = `${e.device_id}::${e.action}`;
+      if (!seen.has(key)) seen.set(key, e);
+    }
+    return Array.from(seen.values());
+  }, [executions]);
 
   const filtered = useMemo(() => {
-    let list = executions ?? [];
-    if (statusFilter !== 'all') list = list.filter(e => e.status === statusFilter);
+    // For pending status, use the deduplicated set so duplicates are hidden everywhere.
+    const nonPending = (executions ?? []).filter(e => e.status !== 'pending');
+    let list = statusFilter === 'pending'
+      ? pending
+      : statusFilter === 'all'
+        ? [...pending, ...nonPending]
+        : nonPending.filter(e => e.status === statusFilter);
     if (actionFilter !== 'all') list = list.filter(e => e.action === actionFilter);
     return list;
-  }, [executions, statusFilter, actionFilter]);
+  }, [executions, pending, statusFilter, actionFilter]);
 
   const stats = useMemo(() => {
     const all = executions ?? [];
     return {
-      total:    all.length,
-      pending:  all.filter(e => e.status === 'pending').length,
+      total:    pending.length + all.filter(e => e.status !== 'pending').length,
+      pending:  pending.length,
       success:  all.filter(e => e.status === 'success').length,
       failed:   all.filter(e => e.status === 'failed').length,
       rejected: all.filter(e => e.status === 'rejected').length,
       blocked:  (blocks ?? []).length,
     };
-  }, [executions, blocks]);
+  }, [executions, pending, blocks]);
 
   const deviceList = devices ?? [];
 

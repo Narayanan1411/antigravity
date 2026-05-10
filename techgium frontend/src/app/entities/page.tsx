@@ -3,8 +3,25 @@
 import { usePolling } from '@/hooks/usePolling';
 import { Entity } from '@/types';
 import Link from 'next/link';
-import { ExternalLink, Search, Filter, FlaskConical } from 'lucide-react';
+import { ExternalLink, Search, Filter } from 'lucide-react';
 import { useState, useMemo } from 'react';
+
+const ONLINE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+
+function isOnline(lastSeen?: string): boolean {
+  if (!lastSeen) return false;
+  return Date.now() - new Date(lastSeen).getTime() < ONLINE_THRESHOLD_MS;
+}
+
+function OnlineDot({ lastSeen }: { lastSeen?: string }) {
+  const online = isOnline(lastSeen);
+  return (
+    <span
+      className={`inline-block w-2 h-2 rounded-full shrink-0 ${online ? 'bg-emerald-500' : 'bg-gray-600'}`}
+      title={online ? 'Online' : `Last seen ${lastSeen ? new Date(lastSeen).toLocaleString() : 'unknown'}`}
+    />
+  );
+}
 
 const RISK_FILTERS = [
   { value: 'all', label: 'All Risk Levels' },
@@ -18,32 +35,37 @@ export default function EntitiesPage() {
   const { data: entities, isLoading } = usePolling<Entity[]>('/entities/');
   const [searchTerm, setSearchTerm] = useState('');
   const [showMyDeviceOnly, setShowMyDeviceOnly] = useState(false);
-  const [showSimulatedOnly, setShowSimulatedOnly] = useState(false);
   const [riskFilter, setRiskFilter] = useState('all');
 
   const filteredEntities = useMemo(() => {
     if (!entities) return [];
 
-    return entities.filter(e => {
+    const list = entities.filter(e => {
       const matchesSearch = e.entity_id.toLowerCase().includes(searchTerm.toLowerCase()) ||
         e.metadata?.ip?.toLowerCase().includes(searchTerm.toLowerCase()) ||
         e.metadata?.hostname?.toLowerCase().includes(searchTerm.toLowerCase());
       const isMyDevice = e.metadata?.owner === 'presenter';
-      const isSimulated = e.metadata?.simulated === 'true';
 
-      // Risk level filter
+      // Discovering devices always pass the risk filter
+      if (e.discovering) return matchesSearch && (!showMyDeviceOnly || isMyDevice);
+
+      const s = e.trust_score ?? 0;
       let matchesRisk = true;
-      if (riskFilter === 'critical') matchesRisk = e.trust_score < 30;
-      else if (riskFilter === 'alert') matchesRisk = e.trust_score >= 30 && e.trust_score < 50;
-      else if (riskFilter === 'monitor') matchesRisk = e.trust_score >= 50 && e.trust_score < 80;
-      else if (riskFilter === 'trusted') matchesRisk = e.trust_score >= 80;
+      if (riskFilter === 'critical') matchesRisk = s < 30;
+      else if (riskFilter === 'alert') matchesRisk = s >= 30 && s < 50;
+      else if (riskFilter === 'monitor') matchesRisk = s >= 50 && s < 80;
+      else if (riskFilter === 'trusted') matchesRisk = s >= 80;
 
-      return matchesSearch &&
-        (!showMyDeviceOnly || isMyDevice) &&
-        (!showSimulatedOnly || isSimulated) &&
-        matchesRisk;
+      return matchesSearch && (!showMyDeviceOnly || isMyDevice) && matchesRisk;
     });
-  }, [entities, searchTerm, showMyDeviceOnly, showSimulatedOnly, riskFilter]);
+
+    // Sort: discovering devices first, then by trust score ascending (most at-risk first)
+    return list.sort((a, b) => {
+      if (a.discovering && !b.discovering) return -1;
+      if (!a.discovering && b.discovering) return 1;
+      return (a.trust_score ?? 100) - (b.trust_score ?? 100);
+    });
+  }, [entities, searchTerm, showMyDeviceOnly, riskFilter]);
 
   if (isLoading && !entities) {
     return <div className="flex items-center justify-center h-full text-gray-400">Loading entities...</div>;
@@ -100,16 +122,6 @@ export default function EntitiesPage() {
           {showMyDeviceOnly ? "My Device Only" : "All Devices"}
         </button>
 
-        <button
-          onClick={() => setShowSimulatedOnly(!showSimulatedOnly)}
-          className={`px-3 py-2 rounded-md text-sm font-medium border transition-colors flex items-center gap-2 ${showSimulatedOnly
-            ? "bg-primary/20 border-primary text-primary"
-            : "bg-white/5 border-white/10 text-gray-400 hover:text-white"
-            }`}
-        >
-          <FlaskConical className="w-4 h-4" />
-          {showSimulatedOnly ? "Simulated Only" : "All Modes"}
-        </button>
       </div>
 
       {/* Results Count */}
@@ -122,7 +134,6 @@ export default function EntitiesPage() {
           <thead>
             <tr>
               <th>Entity ID</th>
-              <th>Type</th>
               <th>TrustScore</th>
               <th>Confidence</th>
               <th>Decision State</th>
@@ -132,51 +143,66 @@ export default function EntitiesPage() {
             </tr>
           </thead>
           <tbody>
-            {filteredEntities.map((entity) => (
-              <tr key={entity.entity_id} className="hover:bg-white/[0.02] transition-colors">
+            {filteredEntities.map((entity) => {
+              const isDiscovering = entity.discovering || entity.decision === 'discovering';
+              const score = entity.trust_score;
+              return (
+              <tr key={entity.entity_id} className={`hover:bg-white/[0.02] transition-colors ${isDiscovering ? 'bg-blue-500/5' : ''}`}>
                 <td className="w-1/4">
-                  <div className="flex flex-col">
+                  <div className="flex flex-col gap-0.5">
                     <span className="font-mono text-sm text-white flex items-center gap-2">
+                      <OnlineDot lastSeen={entity.last_seen} />
                       {entity.entity_id}
                       {entity.metadata?.owner === 'presenter' && (
                         <span className="px-1.5 py-0.5 rounded bg-primary/20 text-primary text-[10px] font-bold uppercase border border-primary/30">
                           You
                         </span>
                       )}
+                      {isDiscovering && (
+                        <span className="px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-400 text-[10px] font-bold uppercase border border-blue-500/30 animate-pulse">
+                          New
+                        </span>
+                      )}
                     </span>
-                    {entity.metadata?.ip && <span className="text-xs text-gray-500 font-mono mt-0.5">{entity.metadata.ip}</span>}
+                    <span className="text-[10px] text-gray-600 ml-4">
+                      {isOnline(entity.last_seen) ? 'Online' : entity.last_seen ? `Offline · ${new Date(entity.last_seen).toLocaleTimeString()}` : 'No data'}
+                    </span>
+                    {entity.metadata?.ip && <span className="text-xs text-gray-500 font-mono ml-4">{entity.metadata.ip}</span>}
                   </div>
                 </td>
                 <td>
-                  <div className="flex flex-col gap-1">
-                    <span className="text-xs px-2 py-0.5 bg-white/5 border border-white/10 rounded w-fit uppercase font-medium text-gray-400">
-                      {entity.metadata?.type || 'workstation'}
-                    </span>
-                    <span className={`text-[10px] px-1.5 py-0.5 rounded border w-fit flex items-center gap-1 ${entity.metadata?.simulated === 'true'
-                      ? "bg-primary/10 border-primary/20 text-primary"
-                      : "bg-emerald-500/10 border-emerald-500/20 text-emerald-500"
-                      }`}>
-                      {entity.metadata?.simulated === 'true' && <FlaskConical className="w-2.5 h-2.5" />}
-                      {entity.metadata?.simulated === 'true' ? "Simulated" : "Real"}
-                    </span>
-                  </div>
-                </td>
-                <td>
-                  <div className="flex items-center gap-3">
-                    <div className="flex-1 h-1.5 w-24 bg-white/5 rounded-full overflow-hidden">
-                      <div
-                        className={`h-full transition-all duration-300 ${getScoreColor(entity.trust_score)}`}
-                        style={{ width: `${entity.trust_score}%` }}
-                      />
+                  {isDiscovering ? (
+                    <div className="flex items-center gap-2">
+                      <div className="flex-1 h-1.5 w-24 bg-white/5 rounded-full overflow-hidden">
+                        <div className="h-full bg-blue-500/40 animate-pulse rounded-full" style={{ width: '100%' }} />
+                      </div>
+                      <span className="text-xs text-blue-400 font-medium">—</span>
                     </div>
-                    <span className="text-sm font-bold w-6">{entity.trust_score}</span>
-                  </div>
+                  ) : (
+                    <div className="flex items-center gap-3">
+                      <div className="flex-1 h-1.5 w-24 bg-white/5 rounded-full overflow-hidden">
+                        <div
+                          className={`h-full transition-all duration-300 ${getScoreColor(score ?? 0)}`}
+                          style={{ width: `${score ?? 0}%` }}
+                        />
+                      </div>
+                      <span className={`text-sm font-bold w-10 ${(score ?? 0) >= 80 ? 'text-emerald-400' : (score ?? 0) >= 50 ? 'text-yellow-400' : (score ?? 0) >= 30 ? 'text-orange-400' : 'text-red-400'}`}>
+                        {score?.toFixed(0) ?? '—'}
+                      </span>
+                    </div>
+                  )}
                 </td>
                 <td>
-                  <span className="text-sm text-gray-300">{entity.confidence}%</span>
+                  {isDiscovering
+                    ? <span className="text-xs text-blue-400 animate-pulse">analyzing…</span>
+                    : <span className="text-sm text-gray-300">{entity.confidence}%</span>
+                  }
                 </td>
                 <td>
-                  <DecisionBadge decision={entity.decision} score={entity.trust_score} />
+                  {isDiscovering
+                    ? <span className="px-2 py-1 rounded text-[11px] font-bold uppercase border bg-blue-500/10 text-blue-400 border-blue-500/20 animate-pulse">Analyzing</span>
+                    : <DecisionBadge decision={entity.decision} score={score ?? 0} />
+                  }
                 </td>
                 <td>
                   <span className="text-xs text-gray-500" suppressHydrationWarning>
@@ -184,7 +210,9 @@ export default function EntitiesPage() {
                   </span>
                 </td>
                 <td>
-                  {entity.active_actions.length > 0 ? (
+                  {isDiscovering ? (
+                    <span className="text-xs text-blue-400 animate-pulse">baseline collection…</span>
+                  ) : entity.active_actions.length > 0 ? (
                     <div className="flex flex-wrap gap-1">
                       {entity.active_actions.map(action => (
                         <span key={action} className="px-1.5 py-0.5 bg-primary/10 text-primary text-[10px] rounded border border-primary/20">
@@ -205,10 +233,11 @@ export default function EntitiesPage() {
                   </Link>
                 </td>
               </tr>
-            ))}
+              );
+            })}
             {filteredEntities.length === 0 && (
               <tr>
-                <td colSpan={8} className="text-center py-12 text-gray-500 italic">
+                <td colSpan={7} className="text-center py-12 text-gray-500 italic">
                   No entities matching your filters
                 </td>
               </tr>
@@ -220,19 +249,21 @@ export default function EntitiesPage() {
   );
 }
 
-function getScoreColor(score: number) {
+function getScoreColor(score: number | null) {
+  if (score === null) return 'bg-blue-500/40';
   if (score >= 80) return 'bg-success';
   if (score >= 50) return 'bg-warning';
   if (score >= 30) return 'bg-alert';
   return 'bg-critical';
 }
 
-function DecisionBadge({ decision, score }: { decision: string, score: number }) {
+function DecisionBadge({ decision, score }: { decision: string, score: number | null }) {
   let colors = "bg-gray-500/10 text-gray-500 border-gray-500/20";
+  const s = score ?? 0;
 
-  if (score >= 80) colors = "bg-success/10 text-success border-success/20";
-  else if (score >= 50) colors = "bg-warning/10 text-warning border-warning/20";
-  else if (score >= 30) colors = "bg-alert/10 text-alert border-alert/20";
+  if (s >= 80) colors = "bg-success/10 text-success border-success/20";
+  else if (s >= 50) colors = "bg-warning/10 text-warning border-warning/20";
+  else if (s >= 30) colors = "bg-alert/10 text-alert border-alert/20";
   else colors = "bg-critical/10 text-critical border-critical/20";
 
   return (

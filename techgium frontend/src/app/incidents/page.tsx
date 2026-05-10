@@ -14,11 +14,11 @@ export default function IncidentsPage() {
         .map(entity => ({
             incident_id: `INC-${entity.entity_id.slice(0, 8).toUpperCase()}`,
             entity,
-            severity: entity.trust_score < 30 ? 'critical' : entity.trust_score < 50 ? 'high' : 'medium',
+            severity: (entity.trust_score ?? 0) < 30 ? 'critical' : (entity.trust_score ?? 0) < 50 ? 'high' : 'medium',
             status: entity.approval_required ? 'pending_approval' : 'active',
             actions: entity.active_actions,
         }))
-        .sort((a, b) => a.entity.trust_score - b.entity.trust_score);
+        .sort((a, b) => (a.entity.trust_score ?? 0) - (b.entity.trust_score ?? 0));
 
     if (isLoading && !entities) {
         return <div className="flex items-center justify-center h-full text-gray-400">Loading incidents...</div>;
@@ -85,11 +85,11 @@ export default function IncidentsPage() {
                                         <div className="flex items-center gap-2">
                                             <div className="w-16 h-1.5 bg-white/10 rounded-full overflow-hidden">
                                                 <div
-                                                    className={`h-full ${getScoreColor(incident.entity.trust_score)}`}
-                                                    style={{ width: `${incident.entity.trust_score}%` }}
+                                                    className={`h-full ${getScoreColor(incident.entity.trust_score ?? 0)}`}
+                                                    style={{ width: `${incident.entity.trust_score ?? 0}%` }}
                                                 />
                                             </div>
-                                            <span className="text-sm font-bold">{incident.entity.trust_score}</span>
+                                            <span className="text-sm font-bold">{incident.entity.trust_score ?? '—'}</span>
                                         </div>
                                     </td>
                                     <td>

@@ -18,10 +18,10 @@ export default function ReportsPage() {
     const riskDistribution = useMemo(() => {
         if (!entities) return [];
         return [
-            { name: 'Trusted (≥80)', value: entities.filter(e => e.trust_score >= 80).length, color: '#22c55e' },
-            { name: 'Monitor (50-79)', value: entities.filter(e => e.trust_score >= 50 && e.trust_score < 80).length, color: '#eab308' },
-            { name: 'Alert (30-49)', value: entities.filter(e => e.trust_score >= 30 && e.trust_score < 50).length, color: '#f97316' },
-            { name: 'Critical (<30)', value: entities.filter(e => e.trust_score < 30).length, color: '#ef4444' },
+            { name: 'Trusted (≥80)', value: entities.filter(e => (e.trust_score ?? 0) >= 80).length, color: '#22c55e' },
+            { name: 'Monitor (50-79)', value: entities.filter(e => (e.trust_score ?? 0) >= 50 && (e.trust_score ?? 0) < 80).length, color: '#eab308' },
+            { name: 'Alert (30-49)', value: entities.filter(e => (e.trust_score ?? 0) >= 30 && (e.trust_score ?? 0) < 50).length, color: '#f97316' },
+            { name: 'Critical (<30)', value: entities.filter(e => (e.trust_score ?? 0) < 30).length, color: '#ef4444' },
         ];
     }, [entities]);
 
@@ -53,7 +53,7 @@ export default function ReportsPage() {
     }
 
     const totalEntities = entities?.length || 0;
-    const avgTrustScore = entities ? Math.round(entities.reduce((sum, e) => sum + e.trust_score, 0) / totalEntities) : 0;
+    const avgTrustScore = entities ? Math.round(entities.reduce((sum, e) => sum + (e.trust_score ?? 0), 0) / totalEntities) : 0;
     const totalActions = logs?.length || 0;
     const simulatedCount = logs?.filter(l => l.simulated).length || 0;
 

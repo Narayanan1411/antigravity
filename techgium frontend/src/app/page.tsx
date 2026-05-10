@@ -33,6 +33,10 @@ import {
 import { useMemo } from 'react';
 import Link from 'next/link';
 
+const ONLINE_MS = 5 * 60 * 1000;
+const isOnlineDevice = (lastSeen?: string) =>
+  !!lastSeen && Date.now() - new Date(lastSeen).getTime() < ONLINE_MS;
+
 export default function Dashboard() {
   const { data: entities, isLoading: entitiesLoading, status } = usePolling<Entity[]>('/entities/');
   const { data: auditLogs } = usePolling<AuditLog[]>('/audit/');
@@ -52,7 +56,7 @@ export default function Dashboard() {
       trusted: entities.filter(e => e.decision === 'trusted').length,
       monitor: entities.filter(e => e.decision === 'monitor').length,
       isolated: entities.filter(e => e.decision === 'isolate' || e.decision === 'emergency').length,
-      highRisk: entities.filter(e => e.trust_score < 40).length,
+      highRisk: entities.filter(e => (e.trust_score ?? 0) < 40).length,
       pendingApprovals: entities.filter(e => e.approval_required).length,
       activeResponses: entities.filter(e => e.active_actions.length > 0).length,
     };
@@ -61,10 +65,10 @@ export default function Dashboard() {
   const riskChartData = useMemo(() => {
     if (!entities) return [];
     return [
-      { name: 'Critical', shortName: '<30', value: entities.filter(e => e.trust_score < 30).length, fill: '#ef4444', gradient: 'url(#criticalGradient)' },
-      { name: 'Alert', shortName: '30-49', value: entities.filter(e => e.trust_score >= 30 && e.trust_score < 50).length, fill: '#f97316', gradient: 'url(#alertGradient)' },
-      { name: 'Monitor', shortName: '50-79', value: entities.filter(e => e.trust_score >= 50 && e.trust_score < 80).length, fill: '#eab308', gradient: 'url(#monitorGradient)' },
-      { name: 'Trusted', shortName: '≥80', value: entities.filter(e => e.trust_score >= 80).length, fill: '#22c55e', gradient: 'url(#trustedGradient)' },
+      { name: 'Critical', shortName: '<30', value: entities.filter(e => (e.trust_score ?? 0) < 30).length, fill: '#ef4444', gradient: 'url(#criticalGradient)' },
+      { name: 'Alert', shortName: '30-49', value: entities.filter(e => (e.trust_score ?? 0) >= 30 && (e.trust_score ?? 0) < 50).length, fill: '#f97316', gradient: 'url(#alertGradient)' },
+      { name: 'Monitor', shortName: '50-79', value: entities.filter(e => (e.trust_score ?? 0) >= 50 && (e.trust_score ?? 0) < 80).length, fill: '#eab308', gradient: 'url(#monitorGradient)' },
+      { name: 'Trusted', shortName: '≥80', value: entities.filter(e => (e.trust_score ?? 0) >= 80).length, fill: '#22c55e', gradient: 'url(#trustedGradient)' },
     ];
   }, [entities]);
 
@@ -307,26 +311,31 @@ export default function Dashboard() {
             High Risk Entities
           </h3>
           <div className="space-y-3">
-            {entities?.filter(e => e.trust_score < 40).slice(0, 5).map(entity => (
+            {entities?.filter(e => (e.trust_score ?? 0) < 40).slice(0, 5).map(entity => (
               <Link
                 key={entity.entity_id}
                 href={`/entities/${entity.entity_id}`}
                 className="block p-3 bg-white/5 rounded-md border border-white/10 hover:border-primary/30 transition-all hover:bg-white/[0.07]"
               >
-                <div className="flex items-center justify-between">
-                  <div>
-                    <div className="text-sm font-medium text-white truncate max-w-[140px]">{entity.entity_id}</div>
-                    <div className="flex items-center gap-2 mt-1">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1.5 mb-1">
+                      <span className={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${isOnlineDevice(entity.last_seen) ? 'bg-emerald-500' : 'bg-gray-600'}`} />
+                      <div className="text-sm font-medium text-white truncate">{entity.entity_id}</div>
+                    </div>
+                    <div className="flex items-center gap-2">
                       <div className="w-16 h-1.5 bg-white/10 rounded-full overflow-hidden">
                         <div
-                          className={`h-full transition-all duration-500 ${entity.trust_score < 30 ? 'bg-critical' : 'bg-alert'}`}
-                          style={{ width: `${entity.trust_score}%` }}
+                          className={`h-full transition-all duration-500 ${(entity.trust_score ?? 0) < 30 ? 'bg-critical' : 'bg-alert'}`}
+                          style={{ width: `${entity.trust_score ?? 0}%` }}
                         />
                       </div>
-                      <span className="text-xs text-gray-500">{entity.trust_score}</span>
+                      <span className={`text-xs font-bold ${(entity.trust_score ?? 0) < 30 ? 'text-red-400' : 'text-orange-400'}`}>
+                        {entity.trust_score?.toFixed(0) ?? '—'}
+                      </span>
                     </div>
                   </div>
-                  <div className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${entity.trust_score < 30
+                  <div className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase shrink-0 ${(entity.trust_score ?? 0) < 30
                     ? "bg-critical/20 text-critical"
                     : "bg-alert/20 text-alert"
                     }`}>

@@ -96,7 +96,7 @@ export default function DataTransparencyPage() {
         }
 
         // Average TrustScore across all entities
-        const avgScore = entities.reduce((sum, e) => sum + e.trust_score, 0) / entities.length;
+        const avgScore = entities.reduce((sum, e) => sum + (e.trust_score ?? 0), 0) / entities.length;
         return Math.round(avgScore);
     }, [entities, selectedEntity]);
 
@@ -210,7 +210,7 @@ export default function DataTransparencyPage() {
                                 <div className="bg-background border border-border rounded-lg p-3">
                                     <div className="text-xs text-gray-400 mb-1">High Risk</div>
                                     <div className="text-2xl font-bold text-alert">
-                                        {entities.filter(e => e.trust_score < 40).length}
+                                        {entities.filter(e => (e.trust_score ?? 0) < 40).length}
                                     </div>
                                 </div>
                             </div>

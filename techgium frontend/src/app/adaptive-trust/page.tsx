@@ -85,13 +85,16 @@ export default function AdaptiveTrustPage() {
         { refreshInterval: 5000, revalidateOnFocus: false }
     );
 
-    const isOnline = status === 'online';
-    const isWarmup = activeId && (detail?.total_event_count ?? 0) < 100;
-    
-    const trust = isWarmup ? 100 : (detail?.trust_score ?? 100);
-    const confidence = isWarmup ? 100 : (detail?.confidence ?? 100);
-    const decision = isWarmup ? 'warming up' : (detail?.decision ?? 'trusted');
-    const catRisks = isWarmup ? { N: 0, I: 0, C: 0, V: 0 } : (detail?.category_risks ?? { N: 0, I: 0, C: 0, V: 0 });
+    const isBackendOnline = status === 'online';
+
+    const ONLINE_MS = 5 * 60 * 1000;
+    const deviceOnline = (lastSeen?: string) =>
+        !!lastSeen && Date.now() - new Date(lastSeen).getTime() < ONLINE_MS;
+
+    const trust = detail?.trust_score ?? 100;
+    const confidence = detail?.confidence ?? 100;
+    const decision = detail?.decision ?? 'trusted';
+    const catRisks = detail?.category_risks ?? { N: 0, I: 0, C: 0, V: 0 };
 
     return (
         <div className="flex flex-col h-full -m-6 overflow-hidden">
@@ -103,9 +106,9 @@ export default function AdaptiveTrustPage() {
                         Guardient <span className="text-gray-400 font-normal">— Adaptive Trust Engine</span>
                     </h1>
                 </div>
-                <div className={`flex items-center gap-2 px-3 py-1 rounded-full text-xs font-medium border ${isOnline ? 'bg-success/10 text-success border-success/20' : 'bg-critical/10 text-critical border-critical/20'}`}>
-                    {isOnline ? <Wifi className="w-3.5 h-3.5" /> : <WifiOff className="w-3.5 h-3.5" />}
-                    {isOnline ? 'LIVE' : 'OFFLINE'}
+                <div className={`flex items-center gap-2 px-3 py-1 rounded-full text-xs font-medium border ${isBackendOnline ? 'bg-success/10 text-success border-success/20' : 'bg-critical/10 text-critical border-critical/20'}`}>
+                    {isBackendOnline ? <Wifi className="w-3.5 h-3.5" /> : <WifiOff className="w-3.5 h-3.5" />}
+                    {isBackendOnline ? 'LIVE' : 'OFFLINE'}
                 </div>
             </div>
 
@@ -142,6 +145,7 @@ export default function AdaptiveTrustPage() {
                     <div className="space-y-1 px-2 pb-3">
                         {entities?.map(ep => {
                             const isSelected = ep.entity_id === activeId;
+                            const online = deviceOnline(ep.last_seen);
                             return (
                                 <div
                                     key={ep.entity_id}
@@ -151,18 +155,26 @@ export default function AdaptiveTrustPage() {
                                         : 'bg-background/50 border border-border/50 hover:border-gray-600'
                                         }`}
                                 >
-                                    <Server className={`w-3.5 h-3.5 shrink-0 ${isSelected ? 'text-primary' : 'text-gray-500'}`} />
+                                    <div className="relative shrink-0">
+                                        <Server className={`w-3.5 h-3.5 ${isSelected ? 'text-primary' : 'text-gray-500'}`} />
+                                        <span
+                                            className={`absolute -bottom-0.5 -right-0.5 w-1.5 h-1.5 rounded-full border border-background ${online ? 'bg-emerald-500' : 'bg-gray-600'}`}
+                                            title={online ? 'Online' : 'Offline'}
+                                        />
+                                    </div>
                                     <div className="flex-1 min-w-0">
                                         <div className={`text-[10px] truncate ${isSelected ? 'text-white font-semibold' : 'text-gray-300'}`}>
                                             {ep.entity_id.slice(0, 14)}…
                                         </div>
-                                        <div className="text-[9px] text-gray-500 uppercase">{ep.metadata?.type || 'device'}</div>
+                                        {!online && (
+                                            <div className="text-[9px] uppercase" style={{ color: '#6b7280' }}>offline</div>
+                                        )}
                                     </div>
                                     <div className="flex flex-col items-end gap-0.5">
-                                        <span className="text-[11px] font-mono font-bold" style={{ color: trustColor(ep.trust_score) }}>
-                                            {ep.trust_score.toFixed(0)}
+                                        <span className="text-[11px] font-mono font-bold" style={{ color: trustColor(ep.trust_score ?? 50) }}>
+                                            {ep.trust_score != null ? ep.trust_score.toFixed(0) : '—'}
                                         </span>
-                                        <span className={`w-1.5 h-1.5 rounded-full`} style={{ backgroundColor: trustColor(ep.trust_score) }} />
+                                        <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: trustColor(ep.trust_score ?? 50) }} />
                                     </div>
                                 </div>
                             );
@@ -280,7 +292,7 @@ export default function AdaptiveTrustPage() {
                                 const Icon = stage.icon;
                                 const isExpanded = expandedStage === i;
                                 // stages 0-6 are "active" once we have live data
-                                const isActive = isOnline && i < 7;
+                                const isActive = isBackendOnline && i < 7;
                                 return (
                                     <React.Fragment key={i}>
                                         <div

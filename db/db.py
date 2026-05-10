@@ -693,6 +693,120 @@ def list_response_executions(
         put_conn(conn)
 
 
+def find_active_execution(device_id: str, action: str,
+                           cooldown_minutes: int = 10) -> Optional[dict]:
+    """
+    Return the most-recent execution for (device_id, action) that should
+    block a new pending record from being created, or None.
+
+    Blocks if:
+      • An existing record has status 'pending' or 'running' (any age), OR
+      • The most-recent record has status 'success' or 'rejected' and was
+        created within cooldown_minutes (default 10 min).
+
+    This prevents the pipeline from re-queueing an approval every 3 seconds
+    after the SOC has already acted on the previous one.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT execution_id, device_id, action, status, triggered_by,
+                       trust_score, risk_score, severity, requires_approval,
+                       approved_by, rejected_by, rejection_reason, description,
+                       metadata, created_at, updated_at, executed_at
+                FROM response_executions
+                WHERE device_id = %s
+                  AND action    = %s
+                  AND (
+                      status IN ('pending', 'running')
+                      OR (
+                          status IN ('success', 'rejected', 'failed')
+                          AND created_at >= NOW() - INTERVAL '%s minutes'
+                      )
+                  )
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (device_id, action, cooldown_minutes))
+            row = cur.fetchone()
+        if not row:
+            return None
+        cols = [
+            "execution_id","device_id","action","status","triggered_by",
+            "trust_score","risk_score","severity","requires_approval",
+            "approved_by","rejected_by","rejection_reason","description",
+            "metadata","created_at","updated_at","executed_at",
+        ]
+        rec = dict(zip(cols, row))
+        for ts_field in ("created_at", "updated_at", "executed_at"):
+            if rec.get(ts_field) and hasattr(rec[ts_field], "isoformat"):
+                rec[ts_field] = rec[ts_field].isoformat()
+        return rec
+    except Exception as exc:
+        conn.rollback()
+        print(f"[DB] find_active_execution error: {exc}")
+        return None
+    finally:
+        put_conn(conn)
+
+
+def touch_device_last_seen(mac: str) -> Optional[str]:
+    """
+    Update last_seen to NOW() for the device matching mac_address.
+    Returns the device_id if found, else None.
+    Called by the ARP scanner every 5 s for every visible MAC so that
+    devices on the hotspot don't appear offline just because they're idle.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE devices SET last_seen = NOW()
+                WHERE mac_address = %s
+                RETURNING device_id
+            """, (mac,))
+            row = cur.fetchone()
+        conn.commit()
+        return row[0] if row else None
+    except Exception as exc:
+        conn.rollback()
+        print(f"[DB] touch_device_last_seen error: {exc}")
+        return None
+    finally:
+        put_conn(conn)
+
+
+def close_duplicate_pending(device_id: str, action: str, keep_execution_id: str) -> int:
+    """
+    Mark all other pending records for (device_id, action) as rejected.
+    Called after approve/reject so the approval queue clears completely.
+    Returns number of records closed.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE response_executions
+                   SET status           = 'rejected',
+                       rejected_by      = 'system',
+                       rejection_reason = 'superseded by ' || %s,
+                       updated_at       = NOW()
+                 WHERE device_id = %s
+                   AND action    = %s
+                   AND status    = 'pending'
+                   AND execution_id != %s
+            """, (keep_execution_id, device_id, action, keep_execution_id))
+            count = cur.rowcount
+        conn.commit()
+        return count
+    except Exception as exc:
+        conn.rollback()
+        print(f"[DB] close_duplicate_pending error: {exc}")
+        return 0
+    finally:
+        put_conn(conn)
+
+
 def upsert_device_block(device_id: str, action: str, blocked_by: str):
     """Register or refresh a device block in the device_blocks table."""
     import uuid as _uuid

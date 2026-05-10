@@ -69,14 +69,23 @@ from pipeline.producer import publish_event
 from pipeline.consumer import BaseConsumer
 from pipeline.topics import RAW_EVENTS
 from db.db import get_conn, put_conn
+import db.db as _db
 from api.device_resolver import resolve_device, lookup_alias, store_device_and_aliases
 
 # Configuration
 INTERFACE = os.getenv("NETWORK_INTERFACE", None)
 DEFAULT_INTERFACES = ("wlp1s0", "eth0", "enp0s3", "enp0s8", "enp1s0", "en0")
-LOCAL_IP_MASK = None
+# LOCAL_IP_PREFIXES is a set of subnet prefixes refreshed dynamically so
+# hotspot subnet changes (e.g. 10.42.0.x appearing after 192.168.x.x) are
+# picked up without restarting the service.
+LOCAL_IP_PREFIXES: set[str] = set()
+LOCAL_IP_MASK = None  # kept for legacy callers, set from first prefix
 flows = {}
 lock = threading.Lock()
+
+# ARP scanner state — MACs already seen so we only act on new ones
+arp_seen_macs: set[str] = set()
+arp_lock = threading.Lock()
 
 # Device type mapping for consistency
 DEVICE_TYPES = ["laptop", "mobile", "iot", "server", "workstation", "router", "printer", "camera"]
@@ -111,24 +120,40 @@ def detect_interface() -> str:
     return ""
 
 
+def refresh_local_prefixes() -> set[str]:
+    """
+    Collect subnet prefixes from ALL non-loopback/docker interfaces and
+    update the global LOCAL_IP_PREFIXES set.  Call this periodically so
+    hotspot subnet changes are picked up without a restart.
+    """
+    global LOCAL_IP_PREFIXES, LOCAL_IP_MASK
+    prefixes: set[str] = set()
+    skip = ("lo", "docker", "veth", "br-", "virbr", "tun", "tap")
+    for iface, addrs in psutil.net_if_addrs().items():
+        if any(iface.startswith(s) for s in skip):
+            continue
+        for addr in addrs:
+            if addr.family != socket.AF_INET:
+                continue
+            octets = addr.address.split(".")
+            if len(octets) != 4:
+                continue
+            if octets[0] == "10":
+                prefixes.add(f"10.{octets[1]}.")   # /16-ish coverage
+            elif octets[0] == "192" and octets[1] == "168":
+                prefixes.add("192.168.")
+            else:
+                prefixes.add(f"{octets[0]}.{octets[1]}.")
+    LOCAL_IP_PREFIXES = prefixes
+    LOCAL_IP_MASK = next(iter(prefixes), "")      # legacy compat
+    return prefixes
+
+
 def get_auto_mask(iface):
-    """Dynamically detects the local network prefix."""
+    """Dynamically detects the local network prefix (legacy helper)."""
     if not iface:
         return ""
-
-    addrs = psutil.net_if_addrs().get(iface, [])
-    for addr in addrs:
-        if addr.family == socket.AF_INET:
-            octets = addr.address.split(".")
-            if len(octets) == 4:
-                if octets[0] == "10":
-                    return "10."
-                if octets[0] == "192" and octets[1] == "168":
-                    return "192.168."
-                if octets[0] == "172":
-                    return f"{octets[0]}.{octets[1]}."
-                return f"{octets[0]}.{octets[1]}."
-    return ""
+    return next(iter(refresh_local_prefixes()), "")
 
 
 # Auto-detect the capture interface when not explicitly configured
@@ -199,12 +224,15 @@ def get_field(layers, field_name):
     val = layers.get(field_name)
     return val[0] if isinstance(val, list) and val else None
 
-def parse_packet(packet):
-    """Parse tshark packet data - same as new_work."""
-    global LOCAL_IP_MASK
-    if LOCAL_IP_MASK is None:
-        LOCAL_IP_MASK = get_auto_mask(INTERFACE)
+def _is_local(ip: str) -> bool:
+    """Check if an IP belongs to any known local subnet prefix."""
+    if not LOCAL_IP_PREFIXES:
+        refresh_local_prefixes()
+    return any(ip.startswith(p) for p in LOCAL_IP_PREFIXES)
 
+
+def parse_packet(packet):
+    """Parse tshark packet data."""
     layers = packet.get("layers", {})
     src_ip = get_field(layers, "ip_src")
     dst_ip = get_field(layers, "ip_dst")
@@ -212,8 +240,8 @@ def parse_packet(packet):
     if not src_ip or not dst_ip:
         return
 
-    is_src_local = src_ip.startswith(LOCAL_IP_MASK)
-    is_dst_local = dst_ip.startswith(LOCAL_IP_MASK)
+    is_src_local = _is_local(src_ip)
+    is_dst_local = _is_local(dst_ip)
 
     if not is_src_local and not is_dst_local:
         return
@@ -323,6 +351,172 @@ def process_flow_for_ml(flow_data: dict):
     except Exception as exc:
         print(f"[Discovery] Anomaly detection error: {exc}")
         return None
+
+
+def get_local_subnets() -> list[str]:
+    """Return CIDR strings for all non-loopback/docker local interfaces."""
+    subnets = []
+    try:
+        addrs = psutil.net_if_addrs()
+        stats = psutil.net_if_stats()
+        for iface, addr_list in addrs.items():
+            if iface.startswith(("lo", "docker", "veth", "br-", "virbr", "tun", "tap")):
+                continue
+            if not stats.get(iface, None) or not stats[iface].isup:
+                continue
+            for addr in addr_list:
+                if addr.family != socket.AF_INET:
+                    continue
+                ip = addr.address
+                netmask = addr.netmask or "255.255.255.0"
+                # Convert to CIDR
+                bits = sum(bin(int(x)).count('1') for x in netmask.split('.'))
+                subnets.append(f"{ip}/{bits}")
+    except Exception as exc:
+        print(f"[ARP] Subnet detection error: {exc}")
+    return subnets
+
+
+def read_proc_arp() -> list[dict]:
+    """Read /proc/net/arp — kernel ARP cache, no root needed."""
+    results = []
+    try:
+        with open("/proc/net/arp") as f:
+            for line in f.readlines()[1:]:
+                parts = line.split()
+                if len(parts) < 6:
+                    continue
+                ip, _, flags, mac, _, iface = parts[:6]
+                # Flags=0x2 means COMPLETE (has a valid MAC)
+                if mac != "00:00:00:00:00:00" and int(flags, 16) & 0x2:
+                    results.append({"ip": ip, "mac": mac.lower()})
+    except Exception as exc:
+        print(f"[ARP] /proc/net/arp read error: {exc}")
+    return results
+
+
+def ping_sweep(subnet: str) -> None:
+    """Ping all hosts in subnet concurrently to populate the ARP cache."""
+    import ipaddress
+    import concurrent.futures
+    try:
+        network = ipaddress.ip_network(subnet, strict=False)
+        hosts = [str(h) for h in network.hosts()][:254]
+
+        def _ping(ip: str) -> None:
+            subprocess.run(
+                ["ping", "-c", "1", "-W", "1", ip],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=64) as ex:
+            ex.map(_ping, hosts)
+    except Exception as exc:
+        print(f"[ARP] Ping sweep error on {subnet}: {exc}")
+
+
+def register_new_device(ip: str, mac: str) -> str:
+    """Register a newly ARP-detected device in the DB and return its device_id."""
+    device_id = resolve_device({
+        "mac_address": mac,
+        "hostname": ip,     # use IP as placeholder hostname until enriched
+        "source_ip": ip,
+        "device_type": None,
+    })
+
+    # Send a minimal synthetic network event so the device enters the pipeline
+    event = {
+        "flows": [{
+            "source_ip":        ip,
+            "destination_ip":   "8.8.8.8",
+            "source_port":      0,
+            "destination_port": 0,
+            "mac_address":      mac,
+            "hostname":         None,
+            "device_type":      None,
+            "os":               None,
+            "dns_query_name":   None,
+            "tls_sni":          None,
+            "bytes_sent":       0,
+            "bytes_received":   0,
+            "session_duration": 0.0,
+            "packet_count":     0,
+            "timestamp":        datetime.now(timezone.utc).isoformat(),
+        }]
+    }
+    try:
+        import requests as _req
+        _req.post(
+            "http://localhost:8000/network/telemetry",
+            json=event,
+            headers={"x-api-key": "NET-KEY-2F4A8C1B"},
+            timeout=3,
+        )
+        print(f"[ARP] Registered new device {mac} ({ip}) → {device_id}")
+    except Exception as exc:
+        print(f"[ARP] Could not send initial event for {mac}: {exc}")
+    return device_id
+
+
+def arp_scanner_loop():
+    """Background thread: ARP-scan every 5 s, register new devices immediately."""
+    global arp_seen_macs
+
+    # Seed with existing DB MACs so we only alert on genuinely new arrivals
+    try:
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT mac_address FROM devices WHERE mac_address IS NOT NULL")
+            for (mac,) in cur.fetchall():
+                arp_seen_macs.add(mac.lower())
+        put_conn(conn)
+        print(f"[ARP] Seeded {len(arp_seen_macs)} known MACs from DB")
+    except Exception as exc:
+        print(f"[ARP] DB seed error: {exc}")
+
+    iface = INTERFACE or detect_interface()
+    if not iface:
+        print("[ARP] No interface found — ARP scanner disabled")
+        return
+
+    # Refresh subnet prefixes before first scan
+    refresh_local_prefixes()
+    print(f"[ARP] Scanner started on {iface}, local prefixes: {LOCAL_IP_PREFIXES}")
+    sweep_counter = 0
+    while True:
+        try:
+            # Refresh subnet prefixes every cycle — hotspot subnets can appear at any time
+            refresh_local_prefixes()
+
+            # Every 60 s do a full ping sweep to populate the ARP cache
+            if sweep_counter % 12 == 0:
+                subnets = get_local_subnets()
+                for subnet in subnets:
+                    threading.Thread(target=ping_sweep, args=(subnet,), daemon=True).start()
+
+            # Always read /proc/net/arp — fast, no privileges needed
+            results = read_proc_arp()
+            for dev in results:
+                mac = dev["mac"].lower()
+                ip  = dev["ip"]
+                with arp_lock:
+                    if mac not in arp_seen_macs:
+                        arp_seen_macs.add(mac)
+                        print(f"[ARP] *** NEW DEVICE DETECTED: {mac} @ {ip} ***")
+                        threading.Thread(
+                            target=register_new_device,
+                            args=(ip, mac),
+                            daemon=True,
+                        ).start()
+                    else:
+                        # Device already known — keep last_seen fresh so it
+                        # doesn't appear offline on an idle but connected device
+                        _db.touch_device_last_seen(mac)
+
+            sweep_counter += 1
+        except Exception as exc:
+            print(f"[ARP] Scanner error: {exc}")
+        time.sleep(5)
 
 
 def start_tshark():
@@ -457,6 +651,9 @@ class NetworkDiscoveryService:
 
         # Start event sender in background thread
         threading.Thread(target=send_network_events, daemon=True).start()
+
+        # Start active ARP scanner — detects new hotspot devices within 5 s
+        threading.Thread(target=arp_scanner_loop, daemon=True).start()
 
         print("[Discovery] Service started. Monitoring network traffic...")
 

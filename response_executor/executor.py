@@ -71,6 +71,17 @@ class ResponseExecutor:
         """
         metadata = metadata or {}
         requires_approval = (action in APPROVAL_REQUIRED_ACTIONS) and not auto_approve
+
+        # Deduplicate: return an existing record rather than creating a new one if:
+        #   - approval-required: any pending/running record, OR a recently resolved
+        #     record (approved/rejected/failed within the last 10 minutes).
+        #   - auto-approved: any pending/running record, OR a recently successful
+        #     record (within the last 3 minutes) to absorb high-frequency pipeline cycles.
+        cooldown = 10 if requires_approval else 3
+        existing = _db.find_active_execution(device_id, action, cooldown_minutes=cooldown)
+        if existing:
+            return existing
+
         status = ActionStatus.PENDING.value if requires_approval else ActionStatus.RUNNING.value
 
         execution_id = f"EXEC-{device_id[:8]}-{uuid.uuid4().hex[:8]}"
@@ -119,12 +130,17 @@ class ResponseExecutor:
                 f"Cannot approve execution {execution_id}: status is '{record['status']}'"
             )
 
-        _db.update_execution_status(
-            execution_id, ActionStatus.RUNNING.value, approved_by=approver
-        )
         action    = record["action"]
         device_id = record["device_id"]
         metadata  = record.get("metadata") or {}
+
+        # Close any duplicate pending records for the same (device_id, action)
+        # before dispatching, so the approval queue clears on a single click.
+        _db.close_duplicate_pending(device_id, action, execution_id)
+
+        _db.update_execution_status(
+            execution_id, ActionStatus.RUNNING.value, approved_by=approver
+        )
 
         self._do_execute(execution_id, action, device_id, metadata)
         self._sync_block_registry(action, device_id, approver)
@@ -142,6 +158,9 @@ class ResponseExecutor:
             raise ValueError(
                 f"Cannot reject execution {execution_id}: status is '{record['status']}'"
             )
+
+        # Close any duplicate pending records for the same (device_id, action).
+        _db.close_duplicate_pending(record["device_id"], record["action"], execution_id)
 
         _db.update_execution_status(
             execution_id,

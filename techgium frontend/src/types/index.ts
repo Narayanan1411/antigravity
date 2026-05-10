@@ -1,4 +1,4 @@
-export type DecisionState = 'trusted' | 'monitor' | 'isolate' | 'emergency';
+export type DecisionState = 'trusted' | 'monitor' | 'isolate' | 'emergency' | 'discovering';
 
 export interface CategoryBreakdown {
   network: number;
@@ -38,11 +38,14 @@ export interface TrustEvaluation {
 
 export interface Entity {
   entity_id: string;
-  trust_score: number;
+  trust_score: number | null;
   confidence: number;
   decision: DecisionState;
+  discovering?: boolean;
   category_breakdown: CategoryBreakdown;
   last_updated: string;
+  last_seen?: string;
+  total_event_count?: number;
   active_actions: string[];
   last_action: string | null;
   approval_required: boolean;
