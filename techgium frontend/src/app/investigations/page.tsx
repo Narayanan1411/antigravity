@@ -2,7 +2,7 @@
 
 import { usePolling } from '@/hooks/usePolling';
 import { AuditLog } from '@/types';
-import { Search, Filter, Clock, Calendar, FlaskConical } from 'lucide-react';
+import { Search, Clock, Calendar } from 'lucide-react';
 import { useState, useMemo } from 'react';
 
 const TIME_RANGES = [
@@ -20,7 +20,6 @@ export default function InvestigationsPage() {
     const [searchTerm, setSearchTerm] = useState('');
     const [categoryFilter, setCategoryFilter] = useState('all');
     const [severityFilter, setSeverityFilter] = useState('all');
-    const [simulatedFilter, setSimulatedFilter] = useState<'all' | 'simulated' | 'real'>('all');
     const [timeRangeHours, setTimeRangeHours] = useState(24);
 
     const filteredLogs = useMemo(() => {
@@ -36,13 +35,9 @@ export default function InvestigationsPage() {
             const matchesTime = logDate >= cutoff;
             const matchesSearch = log.entity_id.toLowerCase().includes(searchTerm.toLowerCase()) ||
                 log.action_type.toLowerCase().includes(searchTerm.toLowerCase());
-            const matchesSimulated = simulatedFilter === 'all' ||
-                (simulatedFilter === 'simulated' && log.simulated) ||
-                (simulatedFilter === 'real' && !log.simulated);
-
-            return matchesTime && matchesSearch && matchesSimulated;
+            return matchesTime && matchesSearch;
         }).sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-    }, [logs, searchTerm, categoryFilter, severityFilter, simulatedFilter, timeRangeHours]);
+    }, [logs, searchTerm, categoryFilter, severityFilter, timeRangeHours]);
 
     // Group logs by entity for cross-entity analysis
     const entityGroups = useMemo(() => {
@@ -102,40 +97,17 @@ export default function InvestigationsPage() {
                     </div>
                 </div>
 
-                <div className="w-40 space-y-1.5">
-                    <label className="text-xs text-gray-500 font-medium">Mode</label>
-                    <div className="relative">
-                        <FlaskConical className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
-                        <select
-                            className="bg-card border border-border rounded-md pl-10 pr-4 py-2 text-sm focus:outline-none focus:border-primary w-full appearance-none"
-                            value={simulatedFilter}
-                            onChange={(e) => setSimulatedFilter(e.target.value as 'all' | 'simulated' | 'real')}
-                        >
-                            <option value="all">All Modes</option>
-                            <option value="simulated">Simulated</option>
-                            <option value="real">Real</option>
-                        </select>
-                    </div>
-                </div>
             </div>
 
             {/* Summary Stats */}
-            <div className="grid grid-cols-4 gap-4">
+            <div className="grid grid-cols-2 gap-4">
                 <div className="soc-card text-center">
-                    <div className="text-3xl font-bold text-white">{filteredLogs.length}</div>
+                    <div className="text-3xl font-bold text-white">{filteredLogs.length.toLocaleString()}</div>
                     <div className="text-xs text-gray-500 mt-1">Total Events</div>
                 </div>
                 <div className="soc-card text-center">
                     <div className="text-3xl font-bold text-white">{Object.keys(entityGroups).length}</div>
                     <div className="text-xs text-gray-500 mt-1">Entities Involved</div>
-                </div>
-                <div className="soc-card text-center">
-                    <div className="text-3xl font-bold text-primary">{filteredLogs.filter(l => l.simulated).length}</div>
-                    <div className="text-xs text-gray-500 mt-1">Simulated</div>
-                </div>
-                <div className="soc-card text-center">
-                    <div className="text-3xl font-bold text-success">{filteredLogs.filter(l => !l.simulated).length}</div>
-                    <div className="text-xs text-gray-500 mt-1">Real</div>
                 </div>
             </div>
 
@@ -151,13 +123,10 @@ export default function InvestigationsPage() {
                         No events matching criteria
                     </div>
                 ) : (
-                    <div className="space-y-4 max-h-[500px] overflow-y-auto pr-2">
-                        {filteredLogs.slice(0, 50).map((log, i) => (
+                    <div className="space-y-4 max-h-[600px] overflow-y-auto pr-2">
+                        {filteredLogs.slice(0, 500).map((log, i) => (
                             <div key={i} className="relative pl-8 pb-4 border-l border-border last:border-0 last:pb-0">
-                                <div className={`absolute left-[-9px] top-0 w-4 h-4 rounded-full border-2 ${log.simulated
-                                    ? 'bg-card border-primary'
-                                    : 'bg-card border-success'
-                                    }`} />
+                                <div className="absolute left-[-9px] top-0 w-4 h-4 rounded-full border-2 bg-card border-primary" />
                                 <div className="flex items-start justify-between mb-1">
                                     <div>
                                         <span className="text-sm font-semibold text-white">{log.action_type}</span>
@@ -174,19 +143,17 @@ export default function InvestigationsPage() {
                                         }`}>
                                         {log.status.toUpperCase()}
                                     </span>
-                                    <span className={`text-[10px] px-1.5 py-0.5 rounded border flex items-center gap-1 ${log.simulated
-                                        ? 'bg-primary/10 text-primary border-primary/20'
-                                        : 'bg-success/10 text-success border-success/20'
-                                        }`}>
-                                        {log.simulated && <FlaskConical className="w-2.5 h-2.5" />}
-                                        {log.simulated ? 'SIMULATED' : 'REAL'}
-                                    </span>
                                     {log.approved_by && (
                                         <span className="text-[10px] text-gray-500">by {log.approved_by}</span>
                                     )}
                                 </div>
                             </div>
                         ))}
+                        {filteredLogs.length > 500 && (
+                            <div className="text-center py-4 text-xs text-gray-500">
+                                Showing 500 of {filteredLogs.length.toLocaleString()} events — narrow the time range to see more
+                            </div>
+                        )}
                     </div>
                 )}
             </div>

@@ -222,6 +222,10 @@ def get_entities():
                     COALESCE(ts.timestamp, d.last_seen) AS score_ts,
                     tst.state                            AS trust_state,
                     ec.cnt                               AS trust_score_count,
+                    COALESCE(d.department, 'Unknown')   AS department,
+                    COALESCE(d.device_source, 'network') AS device_source,
+                    (blk.device_id IS NOT NULL)          AS is_blocked,
+                    blk.reason                           AS block_reason,
                     (
                         SELECT ip FROM events
                         WHERE device_id = d.device_id
@@ -239,6 +243,8 @@ def get_entities():
                 LEFT JOIN LATERAL (
                     SELECT COUNT(*) AS cnt FROM trust_scores WHERE device_id = d.device_id
                 ) ec ON true
+                LEFT JOIN device_blocks blk
+                    ON blk.device_id = d.device_id AND blk.is_active = TRUE
                 ORDER BY d.last_seen DESC NULLS LAST
                 LIMIT 500
             """)
@@ -288,6 +294,10 @@ def get_entities():
                 "last_action":        None if discovering else (dec["active_actions"][0] if dec["active_actions"] else None),
                 "approval_required":  False,
                 "discovering":        discovering,
+                "department":         row.get("department") or "Unknown",
+                "device_source":      row.get("device_source") or "network",
+                "is_blocked":         bool(row.get("is_blocked")),
+                "block_reason":       row.get("block_reason"),
                 "metadata": {
                     "ip":        row.get("last_ip"),
                     "mac":       row.get("mac_address"),
@@ -336,7 +346,6 @@ def get_audit():
                     source
                 FROM alerts
                 ORDER BY timestamp DESC
-                LIMIT 1000
             """)
             rows = cur.fetchall()
 
@@ -416,6 +425,15 @@ def get_transparency_stats():
                 for r in cur.fetchall()
             ]
 
+        # Pull live discovery counters from the running network_discovery_service
+        # module if it's in-process (same Python interpreter).  Falls back to
+        # zeros if the service runs as a separate process.
+        try:
+            from services.network_discovery_service import get_discovery_stats
+            discovery = get_discovery_stats()
+        except Exception:
+            discovery = {"new_devices_found": 0, "total_tracked_macs": 0}
+
         return {
             "total_events":        total_events,
             "high_severity_count": high_sev,
@@ -425,6 +443,8 @@ def get_transparency_stats():
             "category_severity":   {},
             "source_activity":     {},
             "recent_events":       recent_alerts,
+            "new_devices_found":   discovery["new_devices_found"],
+            "total_tracked_macs":  discovery["total_tracked_macs"],
             "last_updated":        datetime.now(timezone.utc).isoformat(),
         }
 
@@ -432,6 +452,7 @@ def get_transparency_stats():
         print(f"[v1/transparency] Error: {exc}")
         return {
             "total_events": 0, "high_severity_count": 0,
+            "new_devices_found": 0, "total_tracked_macs": 0,
             "by_category": {}, "by_source_type": {}, "by_event_type": {},
             "category_severity": {}, "source_activity": {}, "recent_events": [],
             "last_updated": datetime.now(timezone.utc).isoformat(),
@@ -837,6 +858,9 @@ def block_device(payload: BlockRequest):
             triggered_by = payload.blocked_by,
             metadata     = payload.metadata,
         )
+        # executor.block_device returns a special dict when already blocked
+        if isinstance(result, dict) and result.get("status") == "already_blocked":
+            return {"status": "already_blocked", "message": result.get("message"), "existing_block": result.get("existing_block")}
         return {"status": "ok", "execution": result}
     except Exception as exc:
         from fastapi import HTTPException
@@ -982,6 +1006,20 @@ def list_response_actions_legacy():
 # ─────────────────────────────────────────────
 # GET /devices  — For the frontend dropdown
 # ─────────────────────────────────────────────
+
+class DepartmentUpdate(BaseModel):
+    department: str
+
+
+@router.patch("/devices/{device_id}/department")
+def update_department(device_id: str, payload: DepartmentUpdate):
+    """Assign or change the department for a network device. Persists across reconnects."""
+    from db.db import update_device_department
+    ok = update_device_department(device_id, payload.department.strip())
+    if not ok:
+        raise HTTPException(status_code=404, detail="Device not found")
+    return {"device_id": device_id, "department": payload.department.strip()}
+
 
 @router.get("/devices")
 def get_device_list():

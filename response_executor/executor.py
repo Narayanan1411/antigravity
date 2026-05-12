@@ -74,13 +74,21 @@ class ResponseExecutor:
 
         # Deduplicate: return an existing record rather than creating a new one if:
         #   - approval-required: any pending/running record, OR a recently resolved
-        #     record (approved/rejected/failed within the last 10 minutes).
-        #   - auto-approved: any pending/running record, OR a recently successful
-        #     record (within the last 3 minutes) to absorb high-frequency pipeline cycles.
-        cooldown = 10 if requires_approval else 3
-        existing = _db.find_active_execution(device_id, action, cooldown_minutes=cooldown)
-        if existing:
-            return existing
+        #     record within the last 10 minutes.
+        #   - auto-approved pipeline actions: absorb high-frequency cycles (3 min).
+        #   - manual admin actions (block_device, unblock_device): never deduplicate —
+        #     they have their own pre-checks (is_device_blocked) and must always write
+        #     to device_blocks so block state stays in sync.
+        if action in ("block_device", "unblock_device"):
+            cooldown = 0   # bypass deduplication entirely for manual admin actions
+        elif requires_approval:
+            cooldown = 10
+        else:
+            cooldown = 3
+        if cooldown > 0:
+            existing = _db.find_active_execution(device_id, action, cooldown_minutes=cooldown)
+            if existing:
+                return existing
 
         status = ActionStatus.PENDING.value if requires_approval else ActionStatus.RUNNING.value
 
@@ -111,7 +119,7 @@ class ResponseExecutor:
 
         if not requires_approval:
             self._do_execute(execution_id, action, device_id, metadata)
-            self._sync_block_registry(action, device_id, triggered_by)
+            self._sync_block_registry(action, device_id, triggered_by, metadata)
 
         if trust_score < 30:
             self._maybe_send_alert(device_id, action, trust_score)
@@ -143,7 +151,7 @@ class ResponseExecutor:
         )
 
         self._do_execute(execution_id, action, device_id, metadata)
-        self._sync_block_registry(action, device_id, approver)
+        self._sync_block_registry(action, device_id, approver, metadata)
 
         result = _db.get_execution(execution_id)
         self._publish(result)
@@ -175,7 +183,23 @@ class ResponseExecutor:
     def block_device(self, device_id: str, reason: str, triggered_by: str,
                      metadata: Optional[dict] = None) -> dict:
         """Admin-initiated immediate device block — no approval gate."""
-        meta = {"reason": reason, **(metadata or {})}
+        # Refuse to re-block a device that is already blocked.
+        if _db.is_device_blocked(device_id):
+            existing = _db.get_active_block(device_id)
+            return {
+                "status": "already_blocked",
+                "message": f"Device {device_id} is already blocked.",
+                "existing_block": existing,
+            }
+        # Enrich metadata with MAC and last-known IP so the handler can apply
+        # real system-level enforcement (iptables + dnsmasq).
+        device_info = _db.get_device_info(device_id)
+        meta = {
+            "reason": reason,
+            "mac":    device_info.get("mac_address") if device_info else None,
+            "ip":     device_info.get("last_ip")     if device_info else None,
+            **(metadata or {}),
+        }
         return self.execute(
             action="block_device",
             device_id=device_id,
@@ -185,12 +209,28 @@ class ResponseExecutor:
         )
 
     def unblock_device(self, device_id: str, unblocked_by: str) -> dict:
-        """Admin-initiated immediate device unblock — no approval gate."""
+        """Admin-initiated immediate device unblock — no approval gate.
+
+        The DB block is cleared unconditionally BEFORE going through execute()
+        so that deduplication cannot prevent the block from being lifted.
+        MAC/IP are fetched so the handler can remove system-level rules.
+        """
+        # Enrich metadata with MAC so handler can remove iptables / dnsmasq rules.
+        device_info = _db.get_device_info(device_id)
+        meta = {
+            "mac": device_info.get("mac_address") if device_info else None,
+            "ip":  device_info.get("last_ip")     if device_info else None,
+        }
+        # Always clear DB block first — execute() has cooldown=0 so it always
+        # creates a fresh audit record regardless of prior unblocks.
+        _db.remove_device_block(device_id, unblocked_by)
+
         return self.execute(
             action="unblock_device",
             device_id=device_id,
             triggered_by=unblocked_by,
             auto_approve=True,
+            metadata=meta,
         )
 
     # ── Internal helpers ──────────────────────────────────────────────────────
@@ -223,10 +263,12 @@ class ResponseExecutor:
             )
             print(f"[Executor] ✗  {action} on {device_id[:16]} FAILED: {exc}")
 
-    def _sync_block_registry(self, action: str, device_id: str, actor: str) -> None:
+    def _sync_block_registry(self, action: str, device_id: str, actor: str,
+                             metadata: Optional[dict] = None) -> None:
         """Keep the device_blocks table consistent with action outcome."""
         if action in CONTAINMENT_ACTIONS:
-            _db.upsert_device_block(device_id, action, actor)
+            reason = (metadata or {}).get("reason", "")
+            _db.upsert_device_block(device_id, action, actor, reason=reason)
         elif action == "unblock_device":
             _db.remove_device_block(device_id, actor)
 

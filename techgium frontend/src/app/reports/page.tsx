@@ -6,7 +6,6 @@ import { FileText, BarChart3, PieChart, TrendingDown, Shield, Download } from 'l
 import { useMemo } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart as RechartsPie, Pie, Cell } from 'recharts';
 
-const COLORS = ['#22c55e', '#eab308', '#f97316', '#ef4444'];
 
 export default function ReportsPage() {
     const { data: entities, isLoading: entitiesLoading } = usePolling<Entity[]>('/entities/');
@@ -114,17 +113,19 @@ export default function ReportsPage() {
                         <ResponsiveContainer width="100%" height="100%">
                             <RechartsPie>
                                 <Pie
-                                    data={riskDistribution}
+                                    data={riskDistribution.filter(d => d.value > 0)}
                                     cx="50%"
                                     cy="50%"
                                     innerRadius={60}
                                     outerRadius={100}
                                     paddingAngle={2}
                                     dataKey="value"
-                                    label={({ name, value }) => `${name}: ${value}`}
-                                    labelLine={false}
+                                    label={({ name, value, percent }) =>
+                                        value > 0 ? `${name}: ${value} (${(percent * 100).toFixed(0)}%)` : ''
+                                    }
+                                    labelLine={true}
                                 >
-                                    {riskDistribution.map((entry, index) => (
+                                    {riskDistribution.filter(d => d.value > 0).map((entry, index) => (
                                         <Cell key={`cell-${index}`} fill={entry.color} />
                                     ))}
                                 </Pie>

@@ -42,6 +42,10 @@ export interface Entity {
   confidence: number;
   decision: DecisionState;
   discovering?: boolean;
+  department?: string;
+  device_source?: 'network' | 'hypervisor';
+  is_blocked?: boolean;
+  block_reason?: string | null;
   category_breakdown: CategoryBreakdown;
   last_updated: string;
   last_seen?: string;

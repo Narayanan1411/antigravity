@@ -11,7 +11,7 @@ import {
 import {
   Activity, Shield, ShieldOff, ShieldAlert, Clock,
   CheckCircle2, XCircle, AlertTriangle, Zap, Filter,
-  Lock, Unlock, RefreshCw, ChevronDown, ChevronUp,
+  Unlock, RefreshCw, ChevronDown, ChevronUp,
 } from 'lucide-react';
 import { useState, useMemo, useCallback } from 'react';
 
@@ -126,18 +126,27 @@ const ONLINE_MS = 5 * 60 * 1000;
 const deviceOnline = (lastSeen?: string) => !!lastSeen && Date.now() - new Date(lastSeen).getTime() < ONLINE_MS;
 
 function BlockModal({
-  devices, onClose, onSuccess,
-}: { devices: Device[]; onClose: () => void; onSuccess: () => void }) {
+  devices, blocks, onClose, onSuccess,
+}: { devices: Device[]; blocks: DeviceBlock[]; onClose: () => void; onSuccess: () => void }) {
   const [deviceId, setDeviceId] = useState('');
   const [reason, setReason] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
+  const activeBlockIds = new Set((blocks ?? []).map(b => b.device_id));
+  const isAlreadyBlocked = deviceId !== '' && activeBlockIds.has(deviceId);
+  const existingBlock = isAlreadyBlocked ? blocks.find(b => b.device_id === deviceId) : null;
+
   const submit = async () => {
     if (!deviceId) { setError('Please select a device.'); return; }
+    if (isAlreadyBlocked) { setError('This device is already blocked. Unblock it first.'); return; }
     setLoading(true); setError('');
     try {
-      await blockDevice({ device_id: deviceId, reason: reason || 'Manual SOC block' });
+      const res: any = await blockDevice({ device_id: deviceId, reason: reason || 'Manual SOC block' });
+      if (res?.status === 'already_blocked') {
+        setError('This device is already blocked. Unblock it first from the Active Blocks table.');
+        return;
+      }
       onSuccess();
     } catch (e: any) {
       setError(e.message ?? 'Request failed');
@@ -159,28 +168,48 @@ function BlockModal({
             <select
               className="w-full bg-background border border-border rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-primary"
               value={deviceId}
-              onChange={e => setDeviceId(e.target.value)}
+              onChange={e => { setDeviceId(e.target.value); setError(''); }}
             >
               <option value="">— select device —</option>
               {devices.map(d => {
                 const online = deviceOnline(d.last_seen);
+                const blocked = activeBlockIds.has(d.device_id);
                 return (
                   <option key={d.device_id} value={d.device_id}>
-                    {online ? '● ' : '○ '}{d.hostname} · {d.device_id.slice(0, 16)}{online ? '' : ' (offline)'}
+                    {blocked ? '🔒 ' : online ? '● ' : '○ '}
+                    {d.hostname} · {d.device_id.slice(0, 16)}
+                    {blocked ? ' [BLOCKED]' : online ? '' : ' (offline)'}
                   </option>
                 );
               })}
             </select>
           </div>
-          <div>
-            <label className="text-xs text-gray-400 mb-1 block">Reason</label>
-            <input
-              className="w-full bg-background border border-border rounded px-3 py-2 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-primary"
-              placeholder="e.g. Suspected lateral movement"
-              value={reason}
-              onChange={e => setReason(e.target.value)}
-            />
-          </div>
+
+          {/* Already-blocked warning banner */}
+          {isAlreadyBlocked && existingBlock && (
+            <div className="rounded border border-red-400/30 bg-red-400/10 px-3 py-2 text-xs text-red-400 space-y-0.5">
+              <div className="font-semibold flex items-center gap-1">
+                <ShieldOff className="w-3 h-3" /> Already blocked
+              </div>
+              <div>Action: <span className="text-white">{existingBlock.action}</span></div>
+              {existingBlock.reason && <div>Reason: <span className="text-white">{existingBlock.reason}</span></div>}
+              <div>By: <span className="text-white">{existingBlock.blocked_by}</span></div>
+              <div className="mt-1 text-red-300">Use the Unblock button in the Active Blocks table below to lift this block first.</div>
+            </div>
+          )}
+
+          {!isAlreadyBlocked && (
+            <div>
+              <label className="text-xs text-gray-400 mb-1 block">Reason</label>
+              <input
+                className="w-full bg-background border border-border rounded px-3 py-2 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-primary"
+                placeholder="e.g. Suspected lateral movement"
+                value={reason}
+                onChange={e => setReason(e.target.value)}
+              />
+            </div>
+          )}
+
           {error && <p className="text-xs text-red-400">{error}</p>}
         </div>
         <div className="flex gap-2 justify-end pt-1">
@@ -188,8 +217,8 @@ function BlockModal({
             className="px-4 py-2 rounded text-sm text-gray-400 hover:text-white border border-border hover:border-primary/50 transition-colors">
             Cancel
           </button>
-          <button onClick={submit} disabled={loading}
-            className="px-4 py-2 rounded text-sm font-semibold bg-red-500/20 text-red-400 border border-red-400/40 hover:bg-red-500/30 transition-colors disabled:opacity-50">
+          <button onClick={submit} disabled={loading || isAlreadyBlocked}
+            className="px-4 py-2 rounded text-sm font-semibold bg-red-500/20 text-red-400 border border-red-400/40 hover:bg-red-500/30 transition-colors disabled:opacity-40">
             {loading ? 'Blocking…' : 'Block Device'}
           </button>
         </div>
@@ -679,7 +708,7 @@ export default function ResponsesPage() {
 
       {/* Modals */}
       {showBlockModal && (
-        <BlockModal devices={deviceList}
+        <BlockModal devices={deviceList} blocks={blocks ?? []}
           onClose={() => setShowBlockModal(false)}
           onSuccess={() => { setShowBlockModal(false); refresh(); }} />
       )}

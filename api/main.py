@@ -66,6 +66,67 @@ app.add_middleware(
 app.include_router(v1_router, prefix="/api/v1")
 
 
+@app.on_event("startup")
+def _startup_block_sync():
+    """
+    On every API startup:
+    1. Clear stale active-block DB records for devices that no longer exist.
+    2. Log any active blocks so the operator knows what is enforced.
+
+    NOTE: We deliberately do NOT manipulate iptables or nftables here.
+    The system uses NetworkManager-managed nftables rules; mixing iptables-nft
+    commands with native nftables on startup can accidentally remove NM's FORWARD
+    ACCEPT rules, breaking internet for all hotspot clients.  Block/unblock
+    enforcement is applied only when the SOC admin explicitly triggers it.
+    """
+    try:
+        import db.db as _db
+
+        # Fetch active DB blocks for logging
+        conn = _db.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT db.device_id, db.action, d.mac_address
+                    FROM device_blocks db
+                    LEFT JOIN devices d ON d.device_id = db.device_id
+                    WHERE db.is_active = TRUE
+                """)
+                active_blocks = cur.fetchall()
+        finally:
+            _db.put_conn(conn)
+
+        if active_blocks:
+            print(f"[Startup] {len(active_blocks)} device(s) marked blocked in DB:")
+            for dev_id, action, mac in active_blocks:
+                print(f"  {dev_id}  action={action}  mac={mac}")
+            print("[Startup] Use the Response Center to unblock if needed.")
+        else:
+            print("[Startup] No active blocks in DB — system is clean")
+
+        # Remove stale is_active=TRUE rows for devices no longer in devices table
+        conn = _db.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE device_blocks
+                       SET is_active = FALSE,
+                           unblocked_by = 'startup_cleanup',
+                           unblocked_at = NOW()
+                     WHERE is_active = TRUE
+                       AND device_id NOT IN (SELECT device_id FROM devices)
+                """)
+                stale = cur.rowcount
+            conn.commit()
+            if stale:
+                print(f"[Startup] Cleared {stale} stale block record(s) for non-existent devices")
+        finally:
+            _db.put_conn(conn)
+
+    except Exception as exc:
+        print(f"[Startup] Block sync error (non-fatal): {exc}")
+
+
 def _check_key(category: str, key: Optional[str]):
     if key != KEYS[category]:
         raise HTTPException(status_code=403, detail="Invalid API key")

@@ -8,12 +8,10 @@ import {
   Server,
   AlertTriangle,
   Search,
-  Zap,
   ClipboardList,
   FileText,
   Activity,
   BookOpen,
-  Database,
   Brain,
   Target
 } from 'lucide-react';
@@ -32,7 +30,6 @@ const navItems = [
   { name: 'Responses', href: '/responses', icon: Activity },
   { name: 'Audit & Compliance', href: '/audit', icon: ClipboardList },
   { name: 'Adaptive Trust', href: '/adaptive-trust', icon: Brain },
-  { name: 'Data Transparency', href: '/data-transparency', icon: Database },
   { name: 'Reports', href: '/reports', icon: FileText },
   { name: 'Simulation Engine', href: '/simulation', icon: Target },
   { name: 'How It Works', href: '/how-it-works', icon: BookOpen },

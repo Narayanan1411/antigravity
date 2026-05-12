@@ -1,7 +1,7 @@
 """
 Guardient Hardware Monitoring Service
 ======================================
-Polls local hardware metrics and scores them using the LSTM model in new_work/hardware.
+Polls local hardware metrics and scores them using the LSTM model in hardware/.
 Publishes directly to RAW_EVENTS so the Risk/Trust engines can pick it up.
 """
 
@@ -15,10 +15,12 @@ import traceback
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT.parent / "new_work" / "hardware"))
+# Hardware ML module lives in poc Guardient/hardware/ (co-located with the project)
+sys.path.insert(0, str(ROOT / "hardware"))
 
 from pipeline.producer import publish_event
 from pipeline.topics import RAW_EVENTS
+import db.db as _db
 
 # Import the user's hardware modules natively
 try:
@@ -47,6 +49,7 @@ class HardwareMonitoringService:
     def start(self):
         print("[Hardware] Starting Hardware Monitoring Service...")
         self.running = True
+        _db.set_device_source(self.device_id, "hypervisor")
         
         if ML_ENABLED:
             print("[Hardware] Loading existing ML models if any...")

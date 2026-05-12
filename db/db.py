@@ -44,8 +44,22 @@ CREATE TABLE IF NOT EXISTS devices (
     os              TEXT,
     mac_address     TEXT,
     device_type     TEXT,
-    enrichment      JSONB
+    enrichment      JSONB,
+    department      TEXT        DEFAULT 'Unknown',
+    device_source   TEXT        DEFAULT 'network',
+    last_ip         TEXT
 );
+
+-- Add columns to existing installations without dropping data
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS department    TEXT DEFAULT 'Unknown';
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS device_source TEXT DEFAULT 'network';
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS last_ip       TEXT;
+
+-- Classify existing devices: hardware monitoring device = hypervisor, rest = network
+UPDATE devices SET device_source = 'hypervisor'
+WHERE device_id IN (
+    SELECT DISTINCT device_id FROM events WHERE source = 'hardware'
+) AND device_source = 'network';
 
 CREATE TABLE IF NOT EXISTS device_aliases (
     alias       TEXT PRIMARY KEY,
@@ -750,21 +764,70 @@ def find_active_execution(device_id: str, action: str,
         put_conn(conn)
 
 
-def touch_device_last_seen(mac: str) -> Optional[str]:
-    """
-    Update last_seen to NOW() for the device matching mac_address.
-    Returns the device_id if found, else None.
-    Called by the ARP scanner every 5 s for every visible MAC so that
-    devices on the hotspot don't appear offline just because they're idle.
-    """
+def update_device_department(device_id: str, department: str) -> bool:
+    """Persist a user-assigned department for a device. Returns True on success."""
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE devices SET last_seen = NOW()
-                WHERE mac_address = %s
-                RETURNING device_id
-            """, (mac,))
+            cur.execute(
+                "UPDATE devices SET department = %s WHERE device_id = %s",
+                (department, device_id)
+            )
+            updated = cur.rowcount > 0
+        conn.commit()
+        return updated
+    except Exception as exc:
+        conn.rollback()
+        print(f"[DB] update_device_department error: {exc}")
+        return False
+    finally:
+        put_conn(conn)
+
+
+def set_device_source(device_id: str, source: str) -> None:
+    """Set device_source ('network' or 'hypervisor') for a device."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE devices SET device_source = %s WHERE device_id = %s",
+                (source, device_id)
+            )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        print(f"[DB] set_device_source error: {exc}")
+    finally:
+        put_conn(conn)
+
+
+def touch_device_last_seen(mac: str, ip: Optional[str] = None) -> Optional[str]:
+    """
+    Update last_seen (and last_ip if provided) for the device matching mac_address.
+    Returns the device_id if found, else None.
+    Called by the ARP scanner every 5 s for every visible MAC so that:
+      - devices on the hotspot don't appear offline when idle
+      - last_ip is always current so block/unblock has a valid IP for iptables rules
+    """
+    mac_norm = mac.lower().replace("-", ":").strip()
+    mac_plain = mac_norm.replace(":", "")
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            if ip:
+                cur.execute("""
+                    UPDATE devices SET last_seen = NOW(), last_ip = %s
+                    WHERE LOWER(mac_address) = %s
+                       OR LOWER(REPLACE(mac_address, ':', '')) = %s
+                    RETURNING device_id
+                """, (ip, mac_norm, mac_plain))
+            else:
+                cur.execute("""
+                    UPDATE devices SET last_seen = NOW()
+                    WHERE LOWER(mac_address) = %s
+                       OR LOWER(REPLACE(mac_address, ':', '')) = %s
+                    RETURNING device_id
+                """, (mac_norm, mac_plain))
             row = cur.fetchone()
         conn.commit()
         return row[0] if row else None
@@ -807,7 +870,7 @@ def close_duplicate_pending(device_id: str, action: str, keep_execution_id: str)
         put_conn(conn)
 
 
-def upsert_device_block(device_id: str, action: str, blocked_by: str):
+def upsert_device_block(device_id: str, action: str, blocked_by: str, reason: str = ""):
     """Register or refresh a device block in the device_blocks table."""
     import uuid as _uuid
     block_id = f"BLK-{device_id[:8]}-{_uuid.uuid4().hex[:6]}"
@@ -815,17 +878,18 @@ def upsert_device_block(device_id: str, action: str, blocked_by: str):
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO device_blocks (block_id, device_id, action, blocked_by, blocked_at, is_active)
-                VALUES (%s, %s, %s, %s, NOW(), TRUE)
+                INSERT INTO device_blocks (block_id, device_id, action, reason, blocked_by, blocked_at, is_active)
+                VALUES (%s, %s, %s, %s, %s, NOW(), TRUE)
                 ON CONFLICT (device_id) DO UPDATE
                     SET block_id     = EXCLUDED.block_id,
                         action       = EXCLUDED.action,
+                        reason       = EXCLUDED.reason,
                         blocked_by   = EXCLUDED.blocked_by,
                         blocked_at   = NOW(),
                         unblocked_by = NULL,
                         unblocked_at = NULL,
                         is_active    = TRUE
-            """, (block_id, device_id, action, blocked_by))
+            """, (block_id, device_id, action, reason or "", blocked_by))
         conn.commit()
     except Exception as exc:
         conn.rollback()
@@ -901,6 +965,126 @@ def is_device_blocked(device_id: str) -> bool:
     except Exception as exc:
         conn.rollback()
         return False
+    finally:
+        put_conn(conn)
+
+
+def get_device_info(device_id: str) -> Optional[dict]:
+    """
+    Return MAC address and best-known IP for a device (used by block/unblock handlers).
+
+    IP resolution order:
+      1. devices.last_ip column (kept current by the ARP scanner)
+      2. Most recent non-null ip in the events table
+      3. Live ARP / neighbour table lookup by MAC (current connection)
+    """
+    import subprocess
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT d.mac_address, d.last_ip,
+                       (SELECT ip FROM events
+                        WHERE device_id = d.device_id AND ip IS NOT NULL
+                        ORDER BY timestamp DESC LIMIT 1) AS event_ip
+                FROM devices d
+                WHERE d.device_id = %s
+            """, (device_id,))
+            row = cur.fetchone()
+        if not row:
+            return None
+        mac, last_ip, event_ip = row
+        ip = last_ip or event_ip
+    except Exception as exc:
+        conn.rollback()
+        print(f"[DB] get_device_info error: {exc}")
+        return None
+    finally:
+        put_conn(conn)
+
+    # Fallback: look up current IP from the live ARP / neighbour table using MAC
+    if not ip and mac:
+        try:
+            out = subprocess.run(
+                ["ip", "neigh", "show"],
+                capture_output=True, text=True, timeout=3
+            ).stdout
+            mac_norm = mac.lower()
+            for line in out.splitlines():
+                if mac_norm in line.lower() and "FAILED" not in line.upper():
+                    parts = line.split()
+                    if parts:
+                        ip = parts[0]
+                        break
+        except Exception:
+            pass
+
+    return {"mac_address": mac, "last_ip": ip}
+
+
+def get_active_block(device_id: str) -> Optional[dict]:
+    """Return the active device_blocks row for a device, or None."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT block_id, device_id, action, reason, blocked_by, blocked_at
+                FROM device_blocks
+                WHERE device_id = %s AND is_active = TRUE
+                LIMIT 1
+            """, (device_id,))
+            row = cur.fetchone()
+        if not row:
+            return None
+        keys = ["block_id", "device_id", "action", "reason", "blocked_by", "blocked_at"]
+        d = dict(zip(keys, row))
+        if hasattr(d["blocked_at"], "isoformat"):
+            d["blocked_at"] = d["blocked_at"].isoformat()
+        return d
+    except Exception as exc:
+        conn.rollback()
+        return None
+    finally:
+        put_conn(conn)
+
+
+def expire_containment_executions(device_id: str) -> int:
+    """
+    After a manual admin unblock, mark recent pending/running containment-action
+    executions for this device as 'rejected' so the pipeline deduplication
+    window is cleared.  This prevents the next pipeline cycle from seeing a
+    'still active' execution and short-circuiting without calling the block
+    registry — which would cause the device to be immediately re-blocked.
+    Returns the number of rows updated.
+    """
+    CONTAINMENT = (
+        'restrict_network', 'isolate_vlan', 'lock_account',
+        'firewall_block', 'kill_process', 'block_device',
+    )
+    placeholders = ','.join(['%s'] * len(CONTAINMENT))
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                UPDATE response_executions
+                   SET status     = 'rejected',
+                       updated_at = NOW(),
+                       rejection_reason = 'Cleared by admin unblock'
+                 WHERE device_id = %s
+                   AND action IN ({placeholders})
+                   AND status IN ('pending', 'running', 'success')
+                   AND created_at >= NOW() - INTERVAL '15 minutes'
+            """, (device_id, *CONTAINMENT))
+            count = cur.rowcount
+        conn.commit()
+        if count:
+            print(f"[DB] Cleared {count} containment execution(s) for {device_id} after admin unblock")
+        return count
+    except Exception as exc:
+        conn.rollback()
+        print(f"[DB] expire_containment_executions error: {exc}")
+        return 0
     finally:
         put_conn(conn)
 

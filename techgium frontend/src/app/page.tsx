@@ -1,7 +1,7 @@
 'use client';
 
 import { usePolling } from '@/hooks/usePolling';
-import { Entity, AuditLog } from '@/types';
+import { Entity } from '@/types';
 import {
   Users,
   ShieldCheck,
@@ -13,9 +13,10 @@ import {
   Activity,
   Wifi,
   WifiOff,
-  Brain,
   Zap,
-  Target
+  Target,
+  Building2,
+  ScanLine,
 } from 'lucide-react';
 import {
   BarChart,
@@ -28,7 +29,6 @@ import {
   Cell,
   PieChart,
   Pie,
-  Legend
 } from 'recharts';
 import { useMemo } from 'react';
 import Link from 'next/link';
@@ -39,9 +39,8 @@ const isOnlineDevice = (lastSeen?: string) =>
 
 export default function Dashboard() {
   const { data: entities, isLoading: entitiesLoading, status } = usePolling<Entity[]>('/entities/');
-  const { data: auditLogs } = usePolling<AuditLog[]>('/audit/');
   const { data: transparencyStatsData } = usePolling<any>('/transparency/stats', 3000);
-  const transparencyStats = transparencyStatsData || { total_events: 0, high_severity_count: 0 };
+  const transparencyStats = transparencyStatsData || { total_events: 0, high_severity_count: 0, new_devices_found: 0 };
 
   const isBackendOnline = status === 'online';
 
@@ -77,6 +76,27 @@ export default function Dashboard() {
     return riskChartData.filter(d => d.value > 0);
   }, [entities, riskChartData]);
 
+  const departmentStats = useMemo(() => {
+    if (!entities) return [];
+    const networkEntities = entities.filter(e => (e.device_source ?? 'network') === 'network');
+    const map: Record<string, { count: number; scoreSum: number; online: number }> = {};
+    for (const e of networkEntities) {
+      const dept = e.department || 'Unknown';
+      if (!map[dept]) map[dept] = { count: 0, scoreSum: 0, online: 0 };
+      map[dept].count++;
+      map[dept].scoreSum += e.trust_score ?? 0;
+      if (isOnlineDevice(e.last_seen)) map[dept].online++;
+    }
+    return Object.entries(map)
+      .map(([name, { count, scoreSum, online }]) => ({
+        name,
+        count,
+        online,
+        avgScore: count > 0 ? Math.round(scoreSum / count) : 0,
+      }))
+      .sort((a, b) => b.count - a.count);
+  }, [entities]);
+
   if (entitiesLoading && !entities) {
     return <div className="flex items-center justify-center h-full text-gray-400">Loading system data...</div>;
   }
@@ -103,13 +123,21 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* Stats Grid - 8 columns */}
-      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-4">
+      {/* Stats Grid */}
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-9 gap-4">
         <StatCard
           title="Events Analyzed"
           value={transparencyStats.total_events}
           icon={Zap}
           color="text-primary"
+        />
+        <StatCard
+          title="New Devices"
+          value={transparencyStats.new_devices_found}
+          icon={ScanLine}
+          color="text-emerald-400"
+          sub="since last restart"
+          pulse={transparencyStats.new_devices_found > 0}
         />
         <StatCard
           title="High Severity"
@@ -285,23 +313,6 @@ export default function Dashboard() {
             </div>
           </div>
 
-          {/* Risk Level Legend Bar */}
-          <div className="mt-6 pt-4 border-t border-border">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-1 flex-1">
-                <div className="h-2 flex-1 rounded-l-full bg-gradient-to-r from-red-600 to-red-500" />
-                <div className="h-2 flex-1 bg-gradient-to-r from-orange-600 to-orange-500" />
-                <div className="h-2 flex-1 bg-gradient-to-r from-yellow-600 to-yellow-500" />
-                <div className="h-2 flex-1 rounded-r-full bg-gradient-to-r from-green-600 to-green-500" />
-              </div>
-            </div>
-            <div className="flex justify-between mt-2 text-[10px] text-gray-500 uppercase font-medium">
-              <span>Critical Risk</span>
-              <span>Alert</span>
-              <span>Monitor</span>
-              <span>Trusted</span>
-            </div>
-          </div>
         </div>
 
         {/* High Risk Entities */}
@@ -355,6 +366,47 @@ export default function Dashboard() {
           </div>
         </div>
       </div>
+
+      {/* Department Overview */}
+      {departmentStats.length > 0 && (
+        <div className="soc-card">
+          <h3 className="font-semibold text-lg flex items-center gap-2 mb-5">
+            <Building2 className="w-5 h-5 text-primary" />
+            Department Overview
+            <span className="text-xs text-gray-500 font-normal ml-1">— network devices only</span>
+          </h3>
+          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
+            {departmentStats.map(dept => {
+              const scoreColor =
+                dept.avgScore >= 80 ? 'text-emerald-400' :
+                dept.avgScore >= 50 ? 'text-yellow-400' :
+                dept.avgScore >= 30 ? 'text-orange-400' : 'text-red-400';
+              const barColor =
+                dept.avgScore >= 80 ? 'bg-emerald-500' :
+                dept.avgScore >= 50 ? 'bg-yellow-500' :
+                dept.avgScore >= 30 ? 'bg-orange-500' : 'bg-red-500';
+              return (
+                <div key={dept.name} className="bg-white/5 rounded-lg border border-white/10 p-3 space-y-2">
+                  <div className="text-xs font-semibold text-white truncate" title={dept.name}>{dept.name}</div>
+                  <div className="flex items-end justify-between">
+                    <div>
+                      <span className="text-2xl font-bold text-white">{dept.count}</span>
+                      <span className="text-[10px] text-gray-500 ml-1">device{dept.count !== 1 ? 's' : ''}</span>
+                    </div>
+                    <span className={`text-sm font-bold ${scoreColor}`}>{dept.avgScore}</span>
+                  </div>
+                  <div className="h-1 bg-white/10 rounded-full overflow-hidden">
+                    <div className={`h-full ${barColor} rounded-full transition-all`} style={{ width: `${dept.avgScore}%` }} />
+                  </div>
+                  <div className="text-[10px] text-gray-500">
+                    {dept.online} online · avg trust
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -392,19 +444,21 @@ function CustomPieTooltip({ active, payload }: any) {
   );
 }
 
-function StatCard({ title, value, icon: Icon, color, href, pulse }: {
+function StatCard({ title, value, icon: Icon, color, href, pulse, sub }: {
   title: string;
   value: number;
   icon: any;
   color: string;
   href?: string;
   pulse?: boolean;
+  sub?: string;
 }) {
   const content = (
     <div className={`soc-card flex items-start justify-between ${href ? 'hover:border-primary/30 transition-colors cursor-pointer' : ''}`}>
       <div>
         <p className="text-sm text-gray-400 font-medium">{title}</p>
         <p className="text-3xl font-bold text-white mt-1">{value}</p>
+        {sub && <p className="text-[10px] text-gray-600 mt-0.5">{sub}</p>}
       </div>
       <div className={`p-2 rounded-lg bg-white/5 ${color} ${pulse ? 'animate-pulse' : ''}`}>
         <Icon className="w-6 h-6" />
