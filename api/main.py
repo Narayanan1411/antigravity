@@ -70,39 +70,47 @@ app.include_router(v1_router, prefix="/api/v1")
 def _startup_block_sync():
     """
     On every API startup:
-    1. Clear stale active-block DB records for devices that no longer exist.
-    2. Log any active blocks so the operator knows what is enforced.
-
-    NOTE: We deliberately do NOT manipulate iptables or nftables here.
-    The system uses NetworkManager-managed nftables rules; mixing iptables-nft
-    commands with native nftables on startup can accidentally remove NM's FORWARD
-    ACCEPT rules, breaking internet for all hotspot clients.  Block/unblock
-    enforcement is applied only when the SOC admin explicitly triggers it.
+    1. Create the nft guardient_blocks chain (priority -10) so block/unblock
+       works immediately without needing a separate setup step.
+       This chain fires BEFORE NM's filter chains, so DROP rules execute
+       before any ACCEPT — the device loses internet but stays on the hotspot.
+    2. Re-apply nft DROP rules for any device that was blocked in the DB.
+       (nftables rules are not persistent across reboots — we recreate them.)
+    3. Clear stale DB block records for devices no longer in the devices table.
     """
     try:
+        from response_executor.handlers import ensure_guardient_chain, reapply_active_blocks
         import db.db as _db
 
-        # Fetch active DB blocks for logging
+        # Always ensure the nft chain exists — it's wiped on every reboot
+        ok, msg = ensure_guardient_chain()
+        if ok:
+            print(f"[Startup] nft guardient_blocks chain ready")
+        else:
+            print(f"[Startup] nft chain setup warning: {msg}")
+
+        # Fetch active DB blocks and re-apply their nft rules
         conn = _db.get_conn()
         try:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT db.device_id, db.action, d.mac_address
+                    SELECT db.device_id, db.action, db.reason, db.blocked_by,
+                           d.mac_address, d.last_ip
                     FROM device_blocks db
                     LEFT JOIN devices d ON d.device_id = db.device_id
                     WHERE db.is_active = TRUE
                 """)
-                active_blocks = cur.fetchall()
+                rows = cur.fetchall()
+                cols = ["device_id", "action", "reason", "blocked_by", "mac_address", "last_ip"]
+                active_blocks = [dict(zip(cols, r)) for r in rows]
         finally:
             _db.put_conn(conn)
 
         if active_blocks:
-            print(f"[Startup] {len(active_blocks)} device(s) marked blocked in DB:")
-            for dev_id, action, mac in active_blocks:
-                print(f"  {dev_id}  action={action}  mac={mac}")
-            print("[Startup] Use the Response Center to unblock if needed.")
+            print(f"[Startup] Re-applying {len(active_blocks)} active block(s)...")
+            reapply_active_blocks(active_blocks)
         else:
-            print("[Startup] No active blocks in DB — system is clean")
+            print("[Startup] No active blocks — system is clean")
 
         # Remove stale is_active=TRUE rows for devices no longer in devices table
         conn = _db.get_conn()
@@ -119,7 +127,7 @@ def _startup_block_sync():
                 stale = cur.rowcount
             conn.commit()
             if stale:
-                print(f"[Startup] Cleared {stale} stale block record(s) for non-existent devices")
+                print(f"[Startup] Cleared {stale} stale block(s) for non-existent devices")
         finally:
             _db.put_conn(conn)
 
